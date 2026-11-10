@@ -359,6 +359,122 @@ fn config_merges_settings_and_index_consumes_model_defaults() {
 }
 
 #[test]
+fn openai_http_model_can_be_registered_in_global_config_and_used_for_indexing() {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        thread,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("embedding listener");
+    let address = listener.local_addr().expect("embedding address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("embedding request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).expect("request line");
+        assert!(
+            request_line.starts_with("POST /v1/embeddings HTTP/1.1"),
+            "{request_line}"
+        );
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request headers");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().expect("content length");
+            }
+        }
+        let mut request_body = vec![0; content_length];
+        reader.read_exact(&mut request_body).expect("request body");
+        let request_body = String::from_utf8(request_body).expect("request JSON");
+        assert!(request_body.contains("fixture-only synthetic text"));
+        let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("embedding response");
+    });
+
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.path().join("note.md"),
+        "fixture-only synthetic text",
+    )
+    .expect("synthetic source file");
+    let descriptor = json!({
+        "endpoint": format!("http://{address}/v1"),
+        "embedding": {
+            "id": "config-fixture",
+            "model": "synthetic-model",
+            "dimension": 3,
+            "maxBatchSize": 1,
+            "maxRetries": 0
+        }
+    });
+    let descriptor_path = fixture.user.path().join("embedding.json");
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec(&descriptor).expect("descriptor JSON"),
+    )
+    .expect("descriptor file");
+    let descriptor_path = descriptor_path.to_str().expect("descriptor path");
+    let configured = fixture.success(&[
+        "--config",
+        "model",
+        "set",
+        "--embedding-config",
+        descriptor_path,
+        "--default",
+    ]);
+    let output = String::from_utf8_lossy(&configured.stdout);
+    assert!(output.contains("openai-http/config-fixture-"), "{output}");
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.user.path().join(".zvec-grep/config.json")).expect("global config"),
+    )
+    .expect("global config JSON");
+    let reference = config["defaults"]["embedding"]
+        .as_str()
+        .expect("default model");
+    assert_eq!(
+        config["models"][reference]["endpoint"],
+        format!("http://{address}/v1")
+    );
+    assert_eq!(
+        config["models"][reference]["httpEmbedding"]["model"],
+        "synthetic-model"
+    );
+
+    fixture.success(&["--index", "--mode", "direct", "--allow-remote"]);
+    server.join().expect("embedding server");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join(".zvec-grep/manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON");
+    assert_eq!(
+        manifest["index"]["descriptor"]["defaultEmbeddingModel"]["model"]["provider"],
+        "openai-http"
+    );
+    assert_eq!(
+        manifest["index"]["descriptor"]["defaultEmbeddingModel"]["model"]["name"],
+        reference
+            .strip_prefix("openai-http/")
+            .expect("HTTP model reference")
+    );
+    assert_eq!(
+        manifest["index"]["descriptor"]["embeddingConfigs"][reference]["httpEmbedding"]["model"],
+        "synthetic-model"
+    );
+}
+
+#[test]
 fn invalid_config_commands_leave_no_config_file() {
     let fixture = Fixture::new();
     for args in [

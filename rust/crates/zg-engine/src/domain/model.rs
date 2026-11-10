@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 mod info;
 pub(crate) use info::ModelInfo;
 
+mod http_embedding;
+pub use http_embedding::OpenAiHttpEmbeddingConfig;
+
 /// Connection and execution settings.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
@@ -23,6 +26,8 @@ pub(crate) struct ModelConfig<Key = String> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_embedding: Option<OpenAiHttpEmbeddingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<Device>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
@@ -33,6 +38,7 @@ impl<Key> Default for ModelConfig<Key> {
         Self {
             api_key: None,
             endpoint: None,
+            http_embedding: None,
             device: None,
             cache_dir: None,
         }
@@ -45,6 +51,7 @@ impl<Key> std::fmt::Debug for ModelConfig<Key> {
             .debug_struct("ModelConfig")
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("endpoint", &self.endpoint)
+            .field("http_embedding", &self.http_embedding)
             .field("device", &self.device)
             .field("cache_dir", &self.cache_dir)
             .finish()

@@ -2,7 +2,7 @@
 
 use crate::{
     EngineError,
-    domain::model::Device,
+    domain::model::{Device, OpenAiHttpEmbeddingConfig},
     utils::{atomic_write, sync_directory},
 };
 use serde_json::{Map, Value, json};
@@ -178,7 +178,11 @@ fn parse_models(fields: &Map<String, Value>) -> Result<Option<Value>, EngineErro
             return Err(invalid_field(&path));
         }
         let model_fields = value.as_object().ok_or_else(|| invalid_field(&path))?;
-        check_known_fields(model_fields, &["endpoint", "device"], &path)?;
+        check_known_fields(
+            model_fields,
+            &["endpoint", "device", "httpEmbedding"],
+            &path,
+        )?;
         let endpoint = non_empty_string(model_fields, "endpoint", &format!("{path}.endpoint"))?;
         if let Some(endpoint) = &endpoint {
             let valid = reqwest::Url::parse(endpoint)
@@ -196,12 +200,38 @@ fn parse_models(fields: &Map<String, Value>) -> Result<Option<Value>, EngineErro
         }) {
             return Err(invalid_field(&format!("{path}.device")));
         }
+        let http_embedding = model_fields
+            .get("httpEmbedding")
+            .map(|value| {
+                serde_json::from_value::<OpenAiHttpEmbeddingConfig>(value.clone())
+                    .map_err(|_| invalid_field(&format!("{path}.httpEmbedding")))
+            })
+            .transpose()?;
+        if let Some(http_embedding) = &http_embedding {
+            if !reference.starts_with("openai-http/")
+                || http_embedding.reference() != reference.as_str()
+            {
+                return Err(invalid_field(&format!("{path}.httpEmbedding")));
+            }
+            validate_http_embedding_config(http_embedding, &path)?;
+            if endpoint.is_none() {
+                return Err(invalid_field(&format!("{path}.endpoint")));
+            }
+            if device.is_some() {
+                return Err(invalid_field(&format!("{path}.device")));
+            }
+        }
         let mut model = Map::new();
         if let Some(endpoint) = endpoint {
             model.insert("endpoint".to_owned(), json!(endpoint));
         }
         if let Some(device) = device {
             model.insert("device".to_owned(), device.clone());
+        }
+        if let Some(http_embedding) = http_embedding {
+            let value = serde_json::to_value(http_embedding)
+                .map_err(|error| EngineError::internal(error.to_string()))?;
+            model.insert("httpEmbedding".to_owned(), value);
         }
         if !model.is_empty() {
             parsed.insert(reference.to_owned(), Value::Object(model));
@@ -329,6 +359,92 @@ fn non_empty_object(fields: Map<String, Value>) -> Option<Value> {
     (!fields.is_empty()).then_some(Value::Object(fields))
 }
 
+fn validate_http_embedding_config(
+    config: &OpenAiHttpEmbeddingConfig,
+    model_path: &str,
+) -> Result<(), EngineError> {
+    let path = format!("{model_path}.httpEmbedding");
+    if config.id.is_empty()
+        || !config
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_field(&format!("{path}.id")));
+    }
+    if config.model.trim().is_empty() || config.model.chars().any(char::is_control) {
+        return Err(invalid_field(&format!("{path}.model")));
+    }
+    if config.dimension == 0
+        || config.dimension > 65_536
+        || config.max_batch_size == 0
+        || config.max_batch_size > 4096
+        || config.max_input_bytes == 0
+        || config.max_input_bytes > 64 * 1024 * 1024
+        || config.max_concurrency == 0
+        || config.max_concurrency > 64
+        || config.timeout_ms == 0
+        || config.timeout_ms > 3_600_000
+    {
+        return Err(invalid_field(&path));
+    }
+    if config.max_retries > 20
+        || config.retry_window_ms == 0
+        || config.retry_window_ms > 3_600_000
+        || config.retry_base_ms > config.retry_max_ms
+        || config.retry_max_ms > 300_000
+    {
+        return Err(invalid_field(&format!("{path}.retryWindowMs")));
+    }
+    if !matches!(
+        config.metric.as_str(),
+        "cosine" | "dot_product" | "euclidean"
+    ) {
+        return Err(invalid_field(&format!("{path}.metric")));
+    }
+    if config
+        .query_prefix
+        .as_ref()
+        .is_some_and(|prefix| prefix.len() > config.max_input_bytes)
+        || config
+            .document_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.len() > config.max_input_bytes)
+    {
+        return Err(invalid_field(&path));
+    }
+    if let Some(field) = config.purpose_field.as_deref() {
+        let mut bytes = field.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || field.len() > 64
+            || matches!(field, "model" | "input" | "dimensions" | "encoding_format")
+        {
+            return Err(invalid_field(&format!("{path}.purposeField")));
+        }
+    }
+    if config
+        .encoding_format
+        .as_deref()
+        .is_some_and(|format| format != "float")
+    {
+        return Err(invalid_field(&format!("{path}.encodingFormat")));
+    }
+    if let Some(name) = config.api_key_env.as_deref() {
+        let mut bytes = name.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(invalid_field(&format!("{path}.apiKeyEnv")));
+        }
+    }
+    Ok(())
+}
+
 fn invalid_field(path: &str) -> EngineError {
     EngineError::invalid_argument(format!("Invalid global config field: {path}"))
 }
@@ -360,6 +476,20 @@ pub(crate) fn string(value: &Value, path: &[&str]) -> Option<String> {
         current = current.get(*key)?;
     }
     current.as_str().map(str::to_owned)
+}
+
+pub(crate) fn http_embedding(
+    config: &Value,
+    reference: &str,
+) -> Result<Option<OpenAiHttpEmbeddingConfig>, EngineError> {
+    let Some(value) = config["models"][reference].get("httpEmbedding").cloned() else {
+        return Ok(None);
+    };
+    serde_json::from_value(value).map(Some).map_err(|error| {
+        EngineError::internal(format!(
+            "validated HTTP embedding config failed to decode: {error}"
+        ))
+    })
 }
 
 pub(crate) fn device(value: &Value, reference: &str) -> Option<Device> {
@@ -461,6 +591,33 @@ pub fn set_model(
     if let Some(device) = device {
         patch["models"][reference]["device"] = json!(device);
     }
+    if default_model {
+        patch["defaults"]["embedding"] = json!(reference);
+    }
+    update(patch)
+}
+
+/// Registers an OpenAI-compatible runtime model in the shared user configuration.
+/// The key remains an environment-variable name only; no credential value is saved.
+/// # Errors
+/// Returns endpoint, descriptor, validation, and configuration I/O errors.
+pub fn set_http_model(
+    reference: &str,
+    endpoint: &str,
+    embedding: &OpenAiHttpEmbeddingConfig,
+    default_model: bool,
+) -> Result<PathBuf, EngineError> {
+    if embedding.reference() != reference {
+        return Err(EngineError::invalid_argument(
+            "OpenAI-compatible model reference does not match its descriptor",
+        ));
+    }
+    crate::authorization::remote_endpoint(reference, Some(endpoint))?;
+    let mut patch = json!({"models": {}});
+    patch["models"][reference] = json!({
+        "endpoint": endpoint.trim(),
+        "httpEmbedding": embedding,
+    });
     if default_model {
         patch["defaults"]["embedding"] = json!(reference);
     }
@@ -677,6 +834,87 @@ mod tests {
             ),
         ];
         assert_invalid_configs(&invalid);
+    }
+
+    #[test]
+    fn global_config_accepts_and_reads_openai_http_model_registrations() {
+        let embedding: OpenAiHttpEmbeddingConfig = serde_json::from_value(json!({
+            "id": "fixture-model",
+            "model": "served-model",
+            "dimension": 3,
+            "apiKeyEnv": "ZG_TEST_HTTP_EMBEDDING_TOKEN",
+            "purposeField": "input_type"
+        }))
+        .expect("HTTP embedding descriptor");
+        let reference = embedding.reference();
+        let parsed = parse_global_config(&json!({
+            "version": 1,
+            "defaults": {"embedding": reference.clone()},
+            "models": {
+                (reference.clone()): {
+                    "endpoint": "http://127.0.0.1:4141/v1",
+                    "httpEmbedding": embedding
+                }
+            }
+        }))
+        .expect("registered HTTP embedding");
+        assert_eq!(parsed["defaults"]["embedding"], reference);
+        assert_eq!(
+            http_embedding(&parsed, &reference).expect("descriptor decode"),
+            Some(embedding)
+        );
+        assert_eq!(
+            string(&parsed, &["models", &reference, "endpoint"]).as_deref(),
+            Some("http://127.0.0.1:4141/v1")
+        );
+    }
+
+    #[test]
+    fn global_config_rejects_mismatched_openai_http_model_registration() {
+        let embedding: OpenAiHttpEmbeddingConfig = serde_json::from_value(json!({
+            "id": "fixture-model",
+            "model": "served-model",
+            "dimension": 3
+        }))
+        .expect("HTTP embedding descriptor");
+        let error = parse_global_config(&json!({
+            "version": 1,
+            "models": {
+                "openai-http/other-model": {
+                    "endpoint": "http://127.0.0.1:4141/v1",
+                    "httpEmbedding": embedding
+                }
+            }
+        }))
+        .expect_err("descriptor reference must be the configured model key");
+        assert!(
+            error
+                .message()
+                .contains("models.openai-http/other-model.httpEmbedding")
+        );
+    }
+
+    #[test]
+    fn global_config_rejects_reserved_http_purpose_field() {
+        let embedding: OpenAiHttpEmbeddingConfig = serde_json::from_value(json!({
+            "id": "fixture-model",
+            "model": "served-model",
+            "dimension": 3,
+            "purposeField": "model"
+        }))
+        .expect("HTTP embedding descriptor");
+        let reference = embedding.reference();
+        let error = parse_global_config(&json!({
+            "version": 1,
+            "models": {
+                reference: {
+                    "endpoint": "http://127.0.0.1:4141/v1",
+                    "httpEmbedding": embedding
+                }
+            }
+        }))
+        .expect_err("purpose field must not overwrite an OpenAI request field");
+        assert!(error.message().contains("httpEmbedding.purposeField"));
     }
 
     #[test]

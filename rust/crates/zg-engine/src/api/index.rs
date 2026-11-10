@@ -47,6 +47,9 @@ pub mod options {
         pub scan: ScanRulesUpdate,
         /// The single model used to embed text content in this workspace.
         pub embedding: Option<EmbeddingModelSpec>,
+        /// Runtime descriptor for an uncataloged OpenAI-compatible embedding model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub http_embedding: Option<OpenAiHttpEmbeddingConfig>,
         /// Index-only embedding concurrency: llama.cpp contexts, local inference
         /// batches, or remote requests. Local native limits are capped at eight.
         /// Omitted values use `ZVEC_GREP_EMBEDDING_CONCURRENCY`, the legacy
@@ -263,7 +266,7 @@ pub mod options {
         Rescan,
     }
 
-    pub use crate::domain::model::Device;
+    pub use crate::domain::model::{Device, OpenAiHttpEmbeddingConfig};
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct EmbeddingModelSpec {

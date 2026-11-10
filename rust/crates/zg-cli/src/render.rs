@@ -644,17 +644,22 @@ Output:
 const CONFIG_HELP: &str = r"Usage:
   zg --config provider set <provider> --api-key <key>
   zg --config model set <model> [--endpoint <url> | --device <device>] [--default]
+  zg --config model set --embedding-config <JSON> [--default]
 
 Provider options:
   --api-key <key>                   Default API key for the provider
 
 Model options:
-  --endpoint <url>                  Endpoint for a remote embedding model
+  --endpoint <url>                  Endpoint for a catalogued remote model
   --device <device>                 Local device: auto, cpu, metal, vulkan, cuda
+  --embedding-config <JSON>         Register an OpenAI-compatible HTTP model
   --default                         Use this model for new indexes
 
-Remote models support --endpoint; local models support --device. At least one
-model option is required. --default may be used alone or with a runtime option.
+Remote catalog models support --endpoint; local models support --device.
+For an uncataloged OpenAI-compatible model, pass its descriptor with
+--embedding-config. The resulting reference is printed and saved in the global
+configuration; add --default to use it for new indexes. Secrets remain in the
+named environment variable, not the config file.
 Each workspace uses one model for text content. Existing indexes continue to
 use their stored model.
 

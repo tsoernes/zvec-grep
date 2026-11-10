@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use super::{
     llama_cpp::LlamaCppEmbeddingModel, model2vec::Model2VecEmbeddingModel,
-    qwen::QwenEmbeddingModel, transformers::TransformersEmbeddingModel,
+    openai_http::OpenAiHttpEmbeddingModel, qwen::QwenEmbeddingModel,
+    transformers::TransformersEmbeddingModel,
 };
 use crate::domain::model::ModelConfig;
 use crate::models::{
@@ -24,6 +25,24 @@ pub fn create_embedding_model(
     options: Option<ModelConfig>,
     compute_runtime: ModelComputeRuntime,
 ) -> Result<Arc<dyn EmbeddingModel>, ModelError> {
+    let options = options.unwrap_or_default();
+    if reference.starts_with("openai-http/") {
+        let config = options.http_embedding.clone().ok_or_else(|| {
+            ModelError::new(
+                crate::EngineError::INVALID_ARGUMENT,
+                "OpenAI-compatible embedding requires its runtime descriptor",
+                Some(format!("embedding={reference}")),
+            )
+        })?;
+        return Ok(Arc::new(OpenAiHttpEmbeddingModel::new(
+            reference, config, options,
+        )?));
+    }
+    if options.http_embedding.is_some() {
+        return Err(ModelError::invalid_argument(
+            "HTTP embedding descriptor can only be used with an openai-http/<id> reference",
+        ));
+    }
     let entry = get_embedding_model_catalog_entry(reference).ok_or_else(|| {
         ModelError::new(
             crate::EngineError::NOT_FOUND,
@@ -31,7 +50,6 @@ pub fn create_embedding_model(
             Some(format!("embedding={reference}")),
         )
     })?;
-    let options = options.unwrap_or_default();
     match entry {
         EmbeddingCatalogEntry::Model2Vec(config) => Ok(Arc::new(Model2VecEmbeddingModel::new(
             config,

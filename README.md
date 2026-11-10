@@ -80,6 +80,67 @@ zg --index --embedding local/potion-retrieval-32m
 > [!NOTE]
 > The index is stored in `.zvec-grep/` under the indexed project root.
 
+### Runtime-configured OpenAI-compatible embedding servers
+
+Uncataloged models can be selected without recompiling. Create a JSON descriptor:
+
+```json
+{
+  "endpoint": "http://127.0.0.1:8000/v1",
+  "embedding": {
+    "id": "my-local-model",
+    "model": "served-model-id",
+    "dimension": 768,
+    "metric": "cosine",
+    "maxBatchSize": 1,
+    "maxInputBytes": 65536,
+    "maxConcurrency": 2
+  }
+}
+```
+
+Then run `zg --index --embedding-config ./embedding.json`. The command derives a stable
+`openai-http/<id>-<vector-space-hash>` model reference and asks for the usual
+workspace authorization before sending content. To register the descriptor in
+`~/.zvec-grep/config.json` for reuse across workspaces, run
+`zg --config model set --embedding-config ./embedding.json --default`. The command
+prints the stable model reference; omit `--default` to register it without changing
+the default. Thereafter `zg --index` uses the global default, while the same
+workspace authorization is still required before remote content is sent. Only
+the descriptor and the name of any token environment variable are saved, never
+the token value. `endpoint` may be a base URL
+(the root or a path ending in `/v1` resolves to `/v1/embeddings`), an exact
+`/embeddings` URL, or another explicit endpoint path. Query strings, URL-embedded
+credentials, and non-loopback plain HTTP are rejected; use HTTPS for remote
+servers. Connections are direct: environment-configured HTTP proxies are not used,
+so authorization covers the actual network destination. Base URLs are resolved
+before authorization, so the approved and actual destinations match.
+
+For authenticated servers, add `"apiKeyEnv": "MY_EMBEDDING_TOKEN"` inside
+`embedding` and export that variable before indexing/searching. The secret value
+is read only from the named environment variable; it is not serialized into the
+descriptor or workspace manifest, and generic HTTP models do not use provider-key
+fallbacks. Omit `apiKeyEnv` for unauthenticated endpoints. `sendDimensions` and
+`encodingFormat` are omitted unless explicitly configured. The descriptor also
+supports input/query and document prefixes, request limits, timeouts, concurrency,
+and bounded retries that honor delta-seconds or HTTP-date `Retry-After` values.
+For servers that require request purpose metadata, optional `purposeField` adds a
+JSON field with `query` or `document` for the current embedding call; it is omitted
+by default for standard OpenAI-compatible servers.
+Defaults are 64 inputs/request, 1 MiB text bytes/request, concurrency 4, a
+60-second per-request timeout, and three retries within a 30-second window
+(250 ms initial fallback backoff, capped at 5 seconds). All limits are bounded by
+validation. Changes to endpoint, served model, vector shape, preprocessing, or
+request-purpose routing require a rebuild; retries and resource limits do not.
+
+#### GitHub Metis adapter (separate project)
+
+GitHub Metis uses a provider-specific protocol, so it remains outside zg's generic
+HTTP embedding implementation. The optional [standalone Metis adapter](https://github.com/tsoernes/zg-metis-adapter)
+translates requests locally; it forwards input to GitHub and has no persistent
+embedding cache. Review its security notes and use only with independently
+authorized, synthetic test input unless you have approval for the upstream transfer.
+
 ### 2. Choose how to search
 
 #### For agents: ask with OpenCode

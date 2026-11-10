@@ -16,9 +16,10 @@ pub(crate) async fn index_setup(options: IndexSetupOptions) -> Result<IndexSetup
         ..Default::default()
     })
     .map_err(crate::models::ModelError::into_engine_error)?;
-    if default_model.as_deref().is_some_and(|reference| {
-        crate::models::get_embedding_model_catalog_entry(reference).is_none()
-    }) {
+    if let Some(reference) = default_model.as_deref()
+        && crate::models::get_embedding_model_catalog_entry(reference).is_none()
+        && config::http_embedding(&config, reference)?.is_none()
+    {
         return Err(EngineError::invalid_argument(
             "Unsupported default embedding model; run zg --help models",
         ));
@@ -52,6 +53,25 @@ pub(crate) async fn index_setup(options: IndexSetupOptions) -> Result<IndexSetup
             download_bytes: download
                 .map(|download| download.artifacts.iter().map(|a| a.size).sum()),
         });
+    }
+    if let Some(configured_models) = config["models"].as_object() {
+        for (reference, _) in configured_models {
+            let Some(http) = config::http_embedding(&config, reference)? else {
+                continue;
+            };
+            let credential_available = http
+                .api_key_env
+                .as_deref()
+                .is_none_or(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+            models.push(EmbeddingChoice {
+                reference: reference.clone(),
+                local: false,
+                downloaded: false,
+                configured: true,
+                credential_available,
+                download_bytes: None,
+            });
+        }
     }
     sort_choices(&mut models, default_model.as_deref());
     Ok(IndexSetup {

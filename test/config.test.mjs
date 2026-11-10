@@ -88,6 +88,114 @@ test("global config v1 is created securely and merged incrementally", async (t) 
   }
 });
 
+test(
+  "global config preserves and validates OpenAI-compatible embedding descriptors",
+  async (t) => {
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "zvec-grep-http-config-"),
+    );
+    const configPath = join(temporaryDirectory, "config.json");
+    t.after(async () => {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    });
+    const reference = "openai-http/fixture-model-71a58080c0d46699";
+    const descriptor = {
+      id: "fixture-model",
+      model: "served-model",
+      dimension: 3,
+      apiKeyEnv: "TEST_HTTP_EMBEDDING_TOKEN",
+    };
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        defaults: { embedding: reference },
+        models: {
+          [reference]: {
+            endpoint: "http://127.0.0.1:4141/v1",
+            httpEmbedding: descriptor,
+          },
+        },
+      }),
+    );
+    assert.deepEqual(readGlobalConfig(configPath), {
+      version: 1,
+      defaults: { embedding: reference },
+      models: {
+        [reference]: {
+          endpoint: "http://127.0.0.1:4141/v1",
+          httpEmbedding: descriptor,
+        },
+      },
+    });
+    updateGlobalConfig({ client: { mode: "direct" } }, configPath);
+    assert.deepEqual(
+      readGlobalConfig(configPath).models?.[reference]?.httpEmbedding,
+      descriptor,
+    );
+
+    const purposeReference = "openai-http/fixture-model-dd295a8e490abe20";
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        models: {
+          [purposeReference]: {
+            endpoint: "http://127.0.0.1:4141/v1",
+            httpEmbedding: { ...descriptor, purposeField: "input_type" },
+          },
+        },
+      }),
+    );
+    assert.equal(
+      readGlobalConfig(configPath).models?.[purposeReference]?.httpEmbedding
+        ?.purposeField,
+      "input_type",
+    );
+
+    const options = resolveEmbeddingRuntimeOptions(
+      reference,
+      {},
+      {},
+      {
+        version: 1,
+        providers: { "openai-http": { apiKey: "must-not-fallback" } },
+        models: {
+          [reference]: {
+            endpoint: "http://127.0.0.1:4141/v1",
+            httpEmbedding: descriptor,
+          },
+        },
+      },
+      {
+        ZVEC_GREP_API_KEY: "must-not-fallback-either",
+        TEST_HTTP_EMBEDDING_TOKEN: "named-env-token",
+      },
+    );
+    assert.deepEqual(options, {
+      apiKey: "named-env-token",
+      endpoint: "http://127.0.0.1:4141/v1",
+    });
+
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "openai-http/wrong-reference": {
+            endpoint: "http://127.0.0.1:4141/v1",
+            httpEmbedding: descriptor,
+          },
+        },
+      }),
+    );
+    assert.throws(
+      () => readGlobalConfig(configPath),
+      /must match an openai-http model reference/,
+    );
+  },
+);
+
 test("embedding runtime resolver preserves every precedence layer", () => {
   const config = {
     version: 1,

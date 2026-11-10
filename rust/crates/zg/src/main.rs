@@ -319,16 +319,55 @@ fn execute_config(args: zg_cli::ConfigArgs) -> Result<(), Box<dyn Error>> {
                     reference,
                     endpoint,
                     device,
+                    embedding_config,
                     default_model,
                 },
         } => {
-            let path = zg_engine::config::set_model(
-                &reference,
-                endpoint.as_deref(),
-                device.map(Into::into),
-                default_model,
-            )?;
-            ("Model", reference, path)
+            if let Some(descriptor_path) = embedding_config {
+                if endpoint.is_some() || device.is_some() {
+                    return Err(zg_cli::CliError::EmbeddingConfig(
+                        "--embedding-config cannot be combined with --endpoint or --device"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+                let descriptor_path = if descriptor_path.is_absolute() {
+                    descriptor_path
+                } else {
+                    std::env::current_dir()?.join(descriptor_path)
+                };
+                let descriptor = zg_cli::read_openai_http_embedding_descriptor(&descriptor_path)?;
+                let http_reference = descriptor.embedding.reference();
+                if reference
+                    .as_deref()
+                    .is_some_and(|value| value != http_reference)
+                {
+                    return Err(zg_cli::CliError::EmbeddingConfig(format!(
+                        "MODEL must match descriptor reference {http_reference}"
+                    ))
+                    .into());
+                }
+                let path = zg_engine::config::set_http_model(
+                    &http_reference,
+                    &descriptor.endpoint,
+                    &descriptor.embedding,
+                    default_model,
+                )?;
+                ("HTTP embedding model", http_reference, path)
+            } else {
+                let reference = reference.ok_or_else(|| {
+                    zg_cli::CliError::EmbeddingConfig(
+                        "MODEL is required unless --embedding-config is provided".to_owned(),
+                    )
+                })?;
+                let path = zg_engine::config::set_model(
+                    &reference,
+                    endpoint.as_deref(),
+                    device.map(Into::into),
+                    default_model,
+                )?;
+                ("Model", reference, path)
+            }
         }
     };
     zg_cli::write_config_result(
@@ -753,12 +792,25 @@ async fn select_query_index(
         let Some(model) = selection.select(root, color)? else {
             return Err(EngineError::cancelled("Index creation cancelled").into());
         };
+        let is_openai_http = model.reference.starts_with("openai-http/");
+        if is_openai_http && request.api_key.is_some() {
+            return Err(EngineError::invalid_argument(
+                "OpenAI-compatible embedding credentials must come from the configured apiKeyEnv; --api-key is not accepted",
+            )
+            .into());
+        }
         if !model.available()
             && request
                 .api_key
                 .as_ref()
                 .is_none_or(|key| key.trim().is_empty())
         {
+            if is_openai_http {
+                return Err(EngineError::permission_denied(
+                    "The configured OpenAI-compatible embedding model requires its apiKeyEnv variable to be set in the process running zg; the interactive API-key prompt cannot satisfy this setting",
+                )
+                .into());
+            }
             let Some(api_key) = zg_cli::prompt_setup_credential(&model.reference, color)? else {
                 return Err(EngineError::cancelled(
                     "Index creation cancelled; no API Key was saved",
@@ -781,6 +833,8 @@ async fn select_query_index(
             }),
             // Query credentials remain temporary during the implicit build.
             runtime_api_key: if model.local {
+                None
+            } else if is_openai_http {
                 None
             } else {
                 request.api_key.clone()

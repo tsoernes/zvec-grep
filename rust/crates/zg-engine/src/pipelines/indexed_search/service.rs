@@ -277,6 +277,10 @@ fn acquire_search_model_for(
         .map_err(ModelError::into_engine_error)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "authorization and exact persisted vector-space selection must precede runtime admission"
+)]
 fn search_model_request(
     workspace: &Workspace,
     schema: &crate::domain::EmbeddingModelInfo,
@@ -305,6 +309,15 @@ fn search_model_request(
             "--device is only supported for local embedding models",
         ));
     }
+    let is_openai_http = reference.starts_with("openai-http/");
+    if is_openai_http && let Some(requested_endpoint) = options.endpoint.as_deref() {
+        let resolved = crate::authorization::remote_endpoint(&reference, Some(requested_endpoint))?;
+        if runtime.endpoint.as_deref() != Some(resolved.as_str()) {
+            return Err(EngineError::invalid_argument(
+                "OpenAI-compatible endpoint is part of the indexed vector space and cannot be changed for search",
+            ));
+        }
+    }
     let endpoint = if local {
         None
     } else {
@@ -321,34 +334,62 @@ fn search_model_request(
         )?;
         Some(endpoint)
     };
-    let saved_key = if local || options.api_key.is_some() {
-        None
-    } else {
-        runtime
-            .api_key
+    let http_embedding = runtime.http_embedding.clone();
+    if is_openai_http != http_embedding.is_some() {
+        return Err(EngineError::invalid_argument(
+            "openai-http index is missing its persisted runtime descriptor",
+        ));
+    }
+    let api_key = if is_openai_http {
+        if options.api_key.is_some() {
+            return Err(EngineError::invalid_argument(
+                "openai-http credentials must use the persisted apiKeyEnv reference; inline or fallback credentials are not accepted",
+            ));
+        }
+        if let Some(name) = http_embedding
             .as_ref()
-            .map(|key| decrypt_api_key(key, workspace.layout(), &reference))
-            .transpose()?
+            .and_then(|http| http.api_key_env.as_deref())
+        {
+            Some(std::env::var(name).map_err(|_| {
+                EngineError::permission_denied(format!(
+                    "HTTP embedding environment variable {name} is not available"
+                ))
+            })?)
+        } else {
+            None
+        }
+    } else {
+        let saved_key = if local || options.api_key.is_some() {
+            None
+        } else {
+            runtime
+                .api_key
+                .as_ref()
+                .map(|key| decrypt_api_key(key, workspace.layout(), &reference))
+                .transpose()?
+        };
+        (!local)
+            .then(|| {
+                options
+                    .api_key
+                    .clone()
+                    .or(saved_key)
+                    .or_else(|| {
+                        crate::config::string(
+                            &config,
+                            &["providers", schema.model().provider(), "apiKey"],
+                        )
+                    })
+                    .or_else(environment_api_key)
+            })
+            .flatten()
     };
     Ok(ModelRuntimeRequest::new(
         reference.clone(),
         ModelConfig {
-            api_key: (!local)
-                .then(|| {
-                    options
-                        .api_key
-                        .clone()
-                        .or(saved_key)
-                        .or_else(|| {
-                            crate::config::string(
-                                &config,
-                                &["providers", schema.model().provider(), "apiKey"],
-                            )
-                        })
-                        .or_else(environment_api_key)
-                })
-                .flatten(),
+            api_key,
             endpoint,
+            http_embedding,
             device: if local {
                 crate::config::runtime_device(&config, &reference, options.device, runtime.device)?
             } else {

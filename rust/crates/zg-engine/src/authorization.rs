@@ -302,6 +302,57 @@ pub(crate) fn remote_endpoint(
     reference: &str,
     endpoint: Option<&str>,
 ) -> Result<String, EngineError> {
+    if reference.starts_with("openai-http/") {
+        let id = reference.strip_prefix("openai-http/").unwrap_or_default();
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(EngineError::invalid_argument(
+                "OpenAI-compatible embedding reference must use a path-safe non-empty id",
+            ));
+        }
+        let config_endpoint = if endpoint.is_none() {
+            let config = crate::config::read()?;
+            crate::config::string(&config, &["models", reference, "endpoint"])
+        } else {
+            None
+        };
+        let endpoint = endpoint.or(config_endpoint.as_deref()).ok_or_else(|| {
+            EngineError::invalid_argument(
+                "OpenAI-compatible embedding requires an endpoint in --endpoint or ~/.zvec-grep/config.json",
+            )
+        })?;
+        let mut url = reqwest::Url::parse(endpoint.trim())
+            .map_err(|_| EngineError::invalid_argument("Invalid remote embedding endpoint"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.query().is_some()
+        {
+            return Err(EngineError::invalid_argument(
+                "Embedding endpoint must be an HTTP(S) URL without credentials, query, or fragment",
+            ));
+        }
+        if url.scheme() == "http" && !is_loopback_host(url.host_str().unwrap_or_default()) {
+            return Err(EngineError::invalid_argument(
+                "Non-loopback HTTP embedding endpoints are refused; use HTTPS",
+            ));
+        }
+        // Base URLs ending at the root or /v1 receive the OpenAI embeddings
+        // route. A path ending in /embeddings is already an exact endpoint;
+        // any other non-empty path is treated as an explicit custom endpoint.
+        let path = url.path().trim_end_matches('/');
+        if path.is_empty() || path == "/" {
+            url.set_path("/v1/embeddings");
+        } else if path.ends_with("/v1") {
+            url.set_path(&format!("{path}/embeddings"));
+        }
+        return Ok(url.to_string());
+    }
     let Some(EmbeddingCatalogEntry::Qwen(entry)) = get_embedding_model_catalog_entry(reference)
     else {
         return Err(EngineError::invalid_argument(
@@ -326,13 +377,22 @@ pub(crate) fn remote_endpoint(
             "Embedding endpoint must be an HTTP(S) URL without credentials or fragment",
         ));
     }
-    // SDK examples provide an API base URL. Resolve it before consent is
-    // checked so the approved destination and the actual request URL agree.
     let path = url.path().trim_end_matches('/');
     if entry.kind == "text" && path.ends_with("/v1") {
         url.set_path(&format!("{path}/embeddings"));
     }
     Ok(url.to_string())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Persists explicit workspace consent without loading a model or contacting a provider.
@@ -825,6 +885,46 @@ mod tests {
             "https://example.test/v1#fragment",
         ] {
             assert!(remote_endpoint("qwen/qwen3.7-text-embedding", Some(endpoint)).is_err());
+        }
+    }
+
+    #[test]
+    fn openai_http_endpoints_resolve_base_urls_and_reject_unsafe_destinations() {
+        assert_eq!(
+            remote_endpoint("openai-http/fixture", Some("http://127.0.0.1:4141/v1"))
+                .expect("loopback base URL"),
+            "http://127.0.0.1:4141/v1/embeddings",
+        );
+        assert_eq!(
+            remote_endpoint("openai-http/fixture", Some("https://example.test"))
+                .expect("HTTPS base URL"),
+            "https://example.test/v1/embeddings",
+        );
+        assert_eq!(
+            remote_endpoint(
+                "openai-http/fixture",
+                Some("https://example.test/custom/embeddings")
+            )
+            .expect("explicit endpoint"),
+            "https://example.test/custom/embeddings",
+        );
+        assert_eq!(
+            remote_endpoint("openai-http/fixture", Some("http://[::1]:4141/v1"))
+                .expect("IPv6 loopback"),
+            "http://[::1]:4141/v1/embeddings",
+        );
+        assert!(remote_endpoint("openai-http/fixture", None).is_err());
+        for endpoint in [
+            "http://example.test/v1",
+            "https://example.test/v1?token=hidden",
+            "https://user:password@example.test/v1",
+            "https://example.test/v1#fragment",
+            "ftp://example.test/v1",
+        ] {
+            assert!(
+                remote_endpoint("openai-http/fixture", Some(endpoint)).is_err(),
+                "{endpoint}"
+            );
         }
     }
 

@@ -591,6 +591,10 @@ fn acquire_index_models(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "model, credential, and remote authorization resolution must finish before runtime acquisition"
+)]
 fn acquire_model(
     models: &ModelRuntimeManager,
     existing: Option<&Workspace>,
@@ -619,25 +623,57 @@ fn acquire_model(
         .runtime_api_key
         .as_ref()
         .or(options.api_key.as_ref());
-    let saved_key = if local || requested_key.is_some() {
-        None
-    } else if let (Some(workspace), Some(runtime)) = (existing, existing_runtime) {
-        runtime
-            .api_key
+    let http_embedding = options
+        .http_embedding
+        .clone()
+        .or_else(|| existing_runtime.and_then(|runtime| runtime.http_embedding.clone()))
+        .or(crate::config::http_embedding(&config, &reference)?);
+    let is_openai_http = reference.starts_with("openai-http/");
+    if is_openai_http != http_embedding.is_some() {
+        return Err(EngineError::invalid_argument(
+            "openai-http models require an HTTP embedding descriptor, and other models cannot use one",
+        ));
+    }
+    let api_key = if is_openai_http {
+        if requested_key.is_some() {
+            return Err(EngineError::invalid_argument(
+                "openai-http credentials must use the descriptor's apiKeyEnv reference; inline --api-key and fallback credentials are not accepted",
+            ));
+        }
+        if let Some(name) = http_embedding
             .as_ref()
-            .map(|key| decrypt_api_key(key, workspace.layout(), &reference))
-            .transpose()?
+            .and_then(|http| http.api_key_env.as_deref())
+        {
+            Some(env::var(name).map_err(|_| {
+                EngineError::new(
+                    EngineError::PERMISSION_DENIED,
+                    format!("HTTP embedding environment variable {name} is not available"),
+                )
+            })?)
+        } else {
+            None
+        }
     } else {
-        None
-    };
-    let api_key = if local {
-        None
-    } else {
-        requested_key
-            .cloned()
-            .or(saved_key)
-            .or_else(|| crate::config::string(&config, &["providers", provider, "apiKey"]))
-            .or_else(environment_api_key)
+        let saved_key = if local || requested_key.is_some() {
+            None
+        } else if let (Some(workspace), Some(runtime)) = (existing, existing_runtime) {
+            runtime
+                .api_key
+                .as_ref()
+                .map(|key| decrypt_api_key(key, workspace.layout(), &reference))
+                .transpose()?
+        } else {
+            None
+        };
+        if local {
+            None
+        } else {
+            requested_key
+                .cloned()
+                .or(saved_key)
+                .or_else(|| crate::config::string(&config, &["providers", provider, "apiKey"]))
+                .or_else(environment_api_key)
+        }
     };
     let endpoint = options.endpoint.clone().or_else(|| {
         options
@@ -645,6 +681,7 @@ fn acquire_model(
             .as_ref()
             .and_then(|embedding| embedding.endpoint.clone())
             .or_else(|| existing_runtime.and_then(|runtime| runtime.endpoint.clone()))
+            .or_else(|| crate::config::string(&config, &["models", &reference, "endpoint"]))
     });
     let endpoint = if local {
         endpoint
@@ -682,6 +719,7 @@ fn acquire_model(
             ModelConfig {
                 api_key,
                 endpoint,
+                http_embedding,
                 cache_dir: crate::config::model_cache(
                     &config,
                     options
@@ -808,6 +846,11 @@ fn saved_embedding_config(
         .configured_endpoint()
         .map(str::to_owned)
         .or(stored.endpoint);
+    stored.http_embedding = model
+        .http_embedding_config()
+        .cloned()
+        .or_else(|| options.http_embedding.clone())
+        .or(stored.http_embedding);
     if let Some(key) = options.api_key.as_deref() {
         stored.api_key = Some(encrypt_api_key(layout, &reference, key)?);
     }

@@ -1011,6 +1011,7 @@ fn runtime_key_separates_resource_affecting_options_without_storing_api_keys() {
         &ModelConfig {
             api_key: Some("secret-a".to_owned()),
             endpoint: Some("https://example.test/a".to_owned()),
+            http_embedding: None,
             cache_dir: Some(PathBuf::from("/cache/a")),
             device: Some(Device::Cpu),
         },
@@ -1020,6 +1021,7 @@ fn runtime_key_separates_resource_affecting_options_without_storing_api_keys() {
         &ModelConfig {
             api_key: Some("secret-a".to_owned()),
             endpoint: Some("https://example.test/a".to_owned()),
+            http_embedding: None,
             cache_dir: Some(PathBuf::from("/cache/a")),
             device: Some(Device::Cpu),
         },
@@ -1029,6 +1031,7 @@ fn runtime_key_separates_resource_affecting_options_without_storing_api_keys() {
         &ModelConfig {
             api_key: Some("secret-b".to_owned()),
             endpoint: Some("https://example.test/a".to_owned()),
+            http_embedding: None,
             cache_dir: Some(PathBuf::from("/cache/a")),
             device: Some(Device::Cpu),
         },

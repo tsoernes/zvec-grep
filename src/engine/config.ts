@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { EngineError } from "./errors.js";
@@ -15,9 +16,31 @@ export type ZvecGrepProviderConfig = {
 
 export type EmbeddingDevice = "auto" | "cpu" | "metal" | "vulkan" | "cuda";
 
+export type ZvecGrepOpenAiHttpEmbeddingConfig = {
+  id: string;
+  model: string;
+  dimension: number;
+  metric?: "cosine" | "dot_product" | "euclidean";
+  maxBatchSize?: number;
+  maxInputBytes?: number;
+  maxConcurrency?: number;
+  timeoutMs?: number;
+  maxRetries?: number;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  retryWindowMs?: number;
+  apiKeyEnv?: string;
+  queryPrefix?: string;
+  documentPrefix?: string;
+  purposeField?: string;
+  sendDimensions?: boolean;
+  encodingFormat?: "float";
+};
+
 export type ZvecGrepEmbeddingModelConfig = {
   endpoint?: string;
   device?: EmbeddingDevice;
+  httpEmbedding?: ZvecGrepOpenAiHttpEmbeddingConfig;
 };
 
 export type EmbeddingRuntimeConfig = {
@@ -107,13 +130,17 @@ export function resolveEmbeddingRuntimeOptions(
       model?.device ??
       environmentDevice(environment))
     : undefined;
-  return {
-    apiKey:
-      explicit.apiKey ??
+  const apiKey = model?.httpEmbedding
+    ? (model.httpEmbedding.apiKeyEnv
+        ? nonEmptyEnvironmentValue(environment[model.httpEmbedding.apiKeyEnv]) ?? ""
+        : "")
+    : (explicit.apiKey ??
       workspace.apiKey ??
       providerConfig?.apiKey ??
       environmentApiKey(provider, environment) ??
-      "",
+      "");
+  return {
+    apiKey,
     ...(endpoint !== undefined ? { endpoint } : {}),
     ...(device !== undefined ? { device } : {}),
   };
@@ -268,7 +295,7 @@ function parseModels(
     }
     assertKnownFields(
       modelValue,
-      ["endpoint", "device"],
+      ["endpoint", "device", "httpEmbedding"],
       path,
       `models.${reference}`,
     );
@@ -288,6 +315,25 @@ function parseModels(
       path,
       `models.${reference}.device`,
     );
+    const httpEmbedding = parseOpenAiHttpEmbeddingConfig(
+      modelValue.httpEmbedding,
+      path,
+      `models.${reference}.httpEmbedding`,
+    );
+    if (httpEmbedding !== undefined) {
+      if (
+        !reference.startsWith("openai-http/") ||
+        reference !== openAiHttpEmbeddingReference(httpEmbedding) ||
+        endpoint === undefined ||
+        device !== undefined
+      ) {
+        throw invalidConfig(
+          path,
+          `models.${reference}.httpEmbedding must match an openai-http ` +
+            "model reference with an endpoint and no device",
+        );
+      }
+    }
     if (reference.startsWith("local/") && endpoint !== undefined) {
       throw invalidConfig(
         path,
@@ -303,10 +349,279 @@ function parseModels(
     const config: ZvecGrepEmbeddingModelConfig = {
       ...(endpoint !== undefined ? { endpoint } : {}),
       ...(device !== undefined ? { device } : {}),
+      ...(httpEmbedding !== undefined ? { httpEmbedding } : {}),
     };
     if (Object.keys(config).length > 0) models[reference] = config;
   }
   return Object.keys(models).length > 0 ? models : undefined;
+}
+
+function parseOpenAiHttpEmbeddingConfig(
+  value: unknown,
+  path: string,
+  field: string,
+): ZvecGrepOpenAiHttpEmbeddingConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw invalidConfig(path, `${field} must be an object`);
+  const keys = [
+    "id",
+    "model",
+    "dimension",
+    "metric",
+    "maxBatchSize",
+    "maxInputBytes",
+    "maxConcurrency",
+    "timeoutMs",
+    "maxRetries",
+    "retryBaseMs",
+    "retryMaxMs",
+    "retryWindowMs",
+    "apiKeyEnv",
+    "queryPrefix",
+    "documentPrefix",
+    "purposeField",
+    "sendDimensions",
+    "encodingFormat",
+  ];
+  assertKnownFields(value, keys, path, field);
+  const id = optionalString(value.id, path, `${field}.id`);
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id)) {
+    throw invalidConfig(path, `${field}.id must be a non-empty path-safe name`);
+  }
+  const model = optionalString(value.model, path, `${field}.model`);
+  if (
+    model === undefined ||
+    model.trim().length === 0 ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(model)
+  ) {
+    throw invalidConfig(
+      path,
+      `${field}.model must be non-empty and contain no control characters`,
+    );
+  }
+  const dimension = optionalBoundedInteger(
+    value.dimension,
+    path,
+    `${field}.dimension`,
+    1,
+    65_536,
+  );
+  if (dimension === undefined) throw invalidConfig(path, `${field}.dimension is required`);
+  const metric = value.metric;
+  if (
+    metric !== undefined &&
+    !["cosine", "dot_product", "euclidean"].includes(String(metric))
+  ) {
+    throw invalidConfig(path, `${field}.metric must be cosine, dot_product, or euclidean`);
+  }
+  const maxBatchSize = optionalBoundedInteger(
+    value.maxBatchSize,
+    path,
+    `${field}.maxBatchSize`,
+    1,
+    4096,
+  );
+  const maxInputBytes = optionalBoundedInteger(
+    value.maxInputBytes,
+    path,
+    `${field}.maxInputBytes`,
+    1,
+    64 * 1024 * 1024,
+  );
+  const maxConcurrency = optionalBoundedInteger(
+    value.maxConcurrency,
+    path,
+    `${field}.maxConcurrency`,
+    1,
+    64,
+  );
+  const timeoutMs = optionalBoundedInteger(
+    value.timeoutMs,
+    path,
+    `${field}.timeoutMs`,
+    1,
+    3_600_000,
+  );
+  const maxRetries = optionalBoundedInteger(
+    value.maxRetries,
+    path,
+    `${field}.maxRetries`,
+    0,
+    20,
+  );
+  const retryBaseMs = optionalBoundedInteger(
+    value.retryBaseMs,
+    path,
+    `${field}.retryBaseMs`,
+    0,
+    300_000,
+  );
+  const retryMaxMs = optionalBoundedInteger(
+    value.retryMaxMs,
+    path,
+    `${field}.retryMaxMs`,
+    0,
+    300_000,
+  );
+  const retryWindowMs = optionalBoundedInteger(
+    value.retryWindowMs,
+    path,
+    `${field}.retryWindowMs`,
+    1,
+    3_600_000,
+  );
+  const normalizedRetryBase = retryBaseMs ?? 250;
+  const normalizedRetryMax = retryMaxMs ?? 5_000;
+  if (normalizedRetryBase > normalizedRetryMax) {
+    throw invalidConfig(path, `${field}.retryBaseMs must not exceed retryMaxMs`);
+  }
+  const apiKeyEnv = optionalString(value.apiKeyEnv, path, `${field}.apiKeyEnv`);
+  if (
+    apiKeyEnv !== undefined &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)
+  ) {
+    throw invalidConfig(
+      path,
+      `${field}.apiKeyEnv must be an environment variable name`,
+    );
+  }
+  const queryPrefix = optionalString(value.queryPrefix, path, `${field}.queryPrefix`);
+  const documentPrefix = optionalString(
+    value.documentPrefix,
+    path,
+    `${field}.documentPrefix`,
+  );
+  const purposeField = optionalString(
+    value.purposeField,
+    path,
+    `${field}.purposeField`,
+  );
+  if (
+    purposeField !== undefined &&
+    (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(purposeField) ||
+      purposeField.length > 64 ||
+      ["model", "input", "dimensions", "encoding_format"].includes(
+        purposeField,
+      ))
+  ) {
+    throw invalidConfig(
+      path,
+      `${field}.purposeField must be a non-reserved JSON field name`,
+    );
+  }
+  const maxPrefixBytes = maxInputBytes ?? 1_048_576;
+  if (
+    (queryPrefix !== undefined && Buffer.byteLength(queryPrefix, "utf8") > maxPrefixBytes) ||
+    (documentPrefix !== undefined && Buffer.byteLength(documentPrefix, "utf8") > maxPrefixBytes)
+  ) {
+    throw invalidConfig(path, `${field} prefixes exceed maxInputBytes`);
+  }
+  let sendDimensions: boolean | undefined;
+  if (value.sendDimensions !== undefined) {
+    if (typeof value.sendDimensions !== "boolean") {
+      throw invalidConfig(path, `${field}.sendDimensions must be a boolean`);
+    }
+    sendDimensions = value.sendDimensions;
+  }
+  let encodingFormat: "float" | undefined;
+  if (value.encodingFormat !== undefined) {
+    if (value.encodingFormat !== "float") {
+      throw invalidConfig(path, `${field}.encodingFormat currently supports only float`);
+    }
+    encodingFormat = "float";
+  }
+  return {
+    id,
+    model,
+    dimension,
+    ...(metric !== undefined
+      ? { metric: metric as ZvecGrepOpenAiHttpEmbeddingConfig["metric"] }
+      : {}),
+    ...(maxBatchSize !== undefined ? { maxBatchSize } : {}),
+    ...(maxInputBytes !== undefined ? { maxInputBytes } : {}),
+    ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(maxRetries !== undefined ? { maxRetries } : {}),
+    ...(retryBaseMs !== undefined ? { retryBaseMs } : {}),
+    ...(retryMaxMs !== undefined ? { retryMaxMs } : {}),
+    ...(retryWindowMs !== undefined ? { retryWindowMs } : {}),
+    ...(apiKeyEnv !== undefined ? { apiKeyEnv } : {}),
+    ...(queryPrefix !== undefined ? { queryPrefix } : {}),
+    ...(documentPrefix !== undefined ? { documentPrefix } : {}),
+    ...(purposeField !== undefined ? { purposeField } : {}),
+    ...(sendDimensions !== undefined ? { sendDimensions } : {}),
+    ...(encodingFormat !== undefined ? { encodingFormat } : {}),
+  };
+}
+
+function optionalString(
+  value: unknown,
+  path: string,
+  field: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw invalidConfig(path, `${field} must be a string`);
+  }
+  return value;
+}
+
+function optionalBoundedInteger(
+  value: unknown,
+  path: string,
+  field: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw invalidConfig(
+      path,
+      `${field} must be an integer between ${minimum} and ${maximum}`,
+    );
+  }
+  return value;
+}
+
+function openAiHttpEmbeddingReference(
+  config: ZvecGrepOpenAiHttpEmbeddingConfig,
+): string {
+  const hash = createHash("sha256");
+  hash.update(
+    config.purposeField === undefined
+      ? "zvec-grep-openai-http-vector-space-v1\0"
+      : "zvec-grep-openai-http-vector-space-v2\0",
+  );
+  const field = (value: Buffer): void => {
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(value.length));
+    hash.update(length).update(value);
+  };
+  const stringField = (value: string): void => field(Buffer.from(value, "utf8"));
+  const optionalField = (value: string | undefined): void => {
+    if (value === undefined) hash.update(Buffer.from([0]));
+    else {
+      hash.update(Buffer.from([1]));
+      stringField(value);
+    }
+  };
+  stringField(config.id);
+  stringField(config.model);
+  const dimension = Buffer.alloc(8);
+  dimension.writeBigUInt64LE(BigInt(config.dimension));
+  field(dimension);
+  stringField(config.metric ?? "cosine");
+  optionalField(config.queryPrefix);
+  optionalField(config.documentPrefix);
+  if (config.purposeField !== undefined) optionalField(config.purposeField);
+  hash.update(Buffer.from([config.sendDimensions ? 1 : 0]));
+  optionalField(config.encodingFormat);
+  return `openai-http/${config.id}-${hash.digest("hex").slice(0, 16)}`;
 }
 
 function parseClient(

@@ -1147,6 +1147,7 @@ mod tests {
             serde_json::to_value(ModelConfig {
                 api_key: Some(key.clone()),
                 endpoint: Some("https://example.test/embeddings".into()),
+                http_embedding: None,
                 device: Some(crate::domain::model::Device::Cpu),
                 cache_dir: Some(directory.path().join("models")),
             })

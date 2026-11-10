@@ -262,6 +262,29 @@ impl IndexDescriptor {
                 .embedding
                 .ensure_index_compatible(&other_index.embedding)?;
         }
+        for embedding in self.embeddings() {
+            if embedding.model().provider() != "openai-http" {
+                continue;
+            }
+            let reference = embedding.model().reference();
+            let previous = self.embedding_configs.get(&reference);
+            let requested = other.embedding_configs.get(&reference);
+            let compatible = previous
+                .zip(requested)
+                .is_some_and(|(previous, requested)| {
+                    previous.endpoint == requested.endpoint
+                        && previous
+                            .http_embedding
+                            .as_ref()
+                            .zip(requested.http_embedding.as_ref())
+                            .is_some_and(|(left, right)| left.same_embedding_space(right))
+                });
+            if !compatible {
+                return Err(EngineError::invalid_argument(format!(
+                    "existing index uses different OpenAI-compatible endpoint or vector-space settings for {reference}; rebuild the index",
+                )));
+            }
+        }
         if self.graph_indexing != other.graph_indexing {
             let existing = if self.graph_indexing {
                 "stores the code graph"
@@ -365,6 +388,77 @@ mod tests {
         published
             .ensure_index_compatible(&descriptor())
             .expect("matching graph setting");
+    }
+
+    fn custom_http_descriptor(endpoint: &str, model: &str) -> IndexDescriptor {
+        let http = serde_json::from_value::<crate::api::index::options::OpenAiHttpEmbeddingConfig>(
+            serde_json::json!({
+                "id": "fixture",
+                "model": model,
+                "dimension": 2,
+                "queryPrefix": "query: ",
+                "documentPrefix": "document: ",
+                "apiKeyEnv": "SYNTHETIC_TOKEN"
+            }),
+        )
+        .expect("HTTP descriptor");
+        let reference = http.reference();
+        let model_name = reference
+            .strip_prefix("openai-http/")
+            .expect("provider prefix")
+            .to_owned();
+        let info = EmbeddingModelInfo::new(
+            ModelInfo::new(
+                "openai-http",
+                model_name,
+                [ContentKind::Text, ContentKind::Code],
+                64,
+            )
+            .expect("model"),
+            2,
+            EmbeddingMetric::Cosine,
+            None,
+            None,
+        )
+        .expect("embedding");
+        let runtime = ModelConfig {
+            endpoint: Some(endpoint.to_owned()),
+            http_embedding: Some(http),
+            ..ModelConfig::default()
+        };
+        IndexDescriptor::new(
+            info,
+            BTreeMap::new(),
+            BTreeMap::from([(reference, runtime)]),
+            false,
+            FTS_CONFIG,
+        )
+        .expect("index")
+    }
+
+    #[test]
+    fn openai_http_index_compatibility_binds_endpoint_model_and_preprocessing() {
+        let existing = custom_http_descriptor("https://one.example/v1/embeddings", "served-model");
+        existing
+            .ensure_index_compatible(&custom_http_descriptor(
+                "https://one.example/v1/embeddings",
+                "served-model",
+            ))
+            .expect("same vector space");
+        for requested in [
+            custom_http_descriptor("https://two.example/v1/embeddings", "served-model"),
+            custom_http_descriptor("https://one.example/v1/embeddings", "changed-model"),
+        ] {
+            assert!(existing.ensure_index_compatible(&requested).is_err());
+        }
+        let serialized = serde_json::to_string(&IndexState::Enabled(Box::new(existing.clone())))
+            .expect("serialize");
+        assert!(serialized.contains("SYNTHETIC_TOKEN"));
+        assert!(!serialized.contains("synthetic-secret"));
+        assert_eq!(
+            serde_json::from_str::<IndexState>(&serialized).expect("round trip"),
+            IndexState::Enabled(Box::new(existing)),
+        );
     }
 
     #[test]

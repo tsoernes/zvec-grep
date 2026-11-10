@@ -16,9 +16,10 @@ pub struct ResolveEmbeddingReferenceOptions {
 ///
 /// # Errors
 ///
-/// Returns an error only when `ZVEC_GREP_EMBEDDING` selects a model outside
-/// the catalog. Explicit, existing, global and fallback values are not
-/// validated by this function.
+/// Returns an error when `ZVEC_GREP_EMBEDDING` selects a model outside the
+/// catalog, except runtime `openai-http/` references which are validated against
+/// their global descriptor when the runtime is acquired. Explicit, existing,
+/// global and fallback values are not otherwise validated here.
 pub fn resolve_embedding_reference(
     options: ResolveEmbeddingReferenceOptions,
 ) -> Result<Option<String>, ModelError> {
@@ -47,6 +48,7 @@ pub fn resolve_embedding_reference(
 
     if let Some(reference) = &environment_reference
         && get_embedding_model_catalog_entry(reference).is_none()
+        && !reference.starts_with("openai-http/")
     {
         return Err(ModelError::new(
             crate::EngineError::INVALID_ARGUMENT,
@@ -67,6 +69,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{ResolveEmbeddingReferenceOptions, resolve_embedding_reference};
+
+    #[test]
+    fn resolver_accepts_runtime_http_references_from_the_environment() {
+        let reference = "openai-http/fixture-model-71a58080c0d46699";
+        let environment = HashMap::from([("ZVEC_GREP_EMBEDDING".to_owned(), reference.to_owned())]);
+        let resolved = resolve_embedding_reference(ResolveEmbeddingReferenceOptions {
+            environment: Some(environment),
+            ..ResolveEmbeddingReferenceOptions::default()
+        })
+        .expect("runtime HTTP reference should be accepted for config resolution");
+        assert_eq!(resolved.as_deref(), Some(reference));
+    }
 
     #[test]
     fn resolver_matches_typescript_precedence_and_validation() {

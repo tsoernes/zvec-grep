@@ -55,7 +55,9 @@ use zg_engine::api::{
     files::FilesOptions,
     index::{
         IndexOptions,
-        options::{Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
+        options::{
+            Device, EmbeddingModelSpec, GlobRule, OpenAiHttpEmbeddingConfig, ScanRulesUpdate,
+        },
     },
     info::InfoOptions,
     relationships::RelationshipOptions,
@@ -178,7 +180,11 @@ pub enum ProviderAction {
 #[derive(Debug, Subcommand)]
 pub enum ModelAction {
     Set {
-        reference: String,
+        #[arg(value_name = "MODEL")]
+        reference: Option<String>,
+        /// Register a generic OpenAI-compatible embedding descriptor.
+        #[arg(long = "embedding-config", value_name = "JSON")]
+        embedding_config: Option<PathBuf>,
         #[arg(long)]
         endpoint: Option<String>,
         #[arg(long, value_enum, ignore_case = true)]
@@ -618,6 +624,9 @@ pub struct IndexArgs {
     pub api_key: Option<String>,
     #[arg(long)]
     pub endpoint: Option<String>,
+    /// JSON descriptor for an uncataloged OpenAI-compatible embedding model.
+    #[arg(long = "embedding-config", value_name = "JSON")]
+    pub embedding_config: Option<PathBuf>,
     #[arg(long = "embedding-concurrency", value_parser = parse_positive_usize)]
     pub embedding_concurrency: Option<usize>,
     #[arg(long = "allow-remote")]
@@ -804,6 +813,8 @@ pub enum CliError {
     InvalidModifiedRange,
     #[error("zg --index --drop cannot be combined with indexing options")]
     DropWithIndexOptions,
+    #[error("invalid --embedding-config descriptor: {0}")]
+    EmbeddingConfig(String),
     #[error("use `zg --server --stdio` or choose one of: on, off, status, run")]
     MissingServerAction,
     #[error("--stdio cannot be combined with a server action")]
@@ -1593,10 +1604,43 @@ fn is_path_query(query: &str) -> bool {
             }))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiHttpEmbeddingDescriptorFile {
+    pub endpoint: String,
+    pub embedding: OpenAiHttpEmbeddingConfig,
+}
+
+pub fn read_openai_http_embedding_descriptor(
+    path: &Path,
+) -> Result<OpenAiHttpEmbeddingDescriptorFile, CliError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        CliError::EmbeddingConfig(format!("cannot inspect {}: {error}", path.display()))
+    })?;
+    if metadata.len() > 1024 * 1024 {
+        return Err(CliError::EmbeddingConfig(
+            "descriptor exceeds the 1 MiB size limit".to_owned(),
+        ));
+    }
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        CliError::EmbeddingConfig(format!("cannot read {}: {error}", path.display()))
+    })?;
+    serde_json::from_str(&contents)
+        .map_err(|error| CliError::EmbeddingConfig(format!("{} ({error})", path.display())))
+}
+
 fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliError> {
     args.model_cache = args
         .model_cache
         .map(|path| resolve_from(current_dir, Some(&path)));
+    args.embedding_config = args
+        .embedding_config
+        .map(|path| resolve_from(current_dir, Some(&path)));
+    let http_descriptor = args
+        .embedding_config
+        .as_deref()
+        .map(read_openai_http_embedding_descriptor)
+        .transpose()?;
     let root = resolve_from(current_dir, args.root.as_deref());
     let mode = resolve_client_mode(args.mode)?;
     let home = args.home.clone();
@@ -1614,6 +1658,7 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             || args.device.is_some()
             || args.api_key.is_some()
             || args.endpoint.is_some()
+            || args.embedding_config.is_some()
             || args.embedding_concurrency.is_some()
             || args.allow_remote
             || args.debug
@@ -1646,11 +1691,31 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             .map(|path| resolve_from(current_dir, Some(&path)))
             .collect()
     });
-    let embedding = args.embedding.map(|reference| EmbeddingModelSpec {
+    let http_embedding = http_descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.embedding.clone());
+    let http_reference = http_embedding
+        .as_ref()
+        .map(OpenAiHttpEmbeddingConfig::reference);
+    if let (Some(requested), Some(expected)) =
+        (args.embedding.as_deref(), http_reference.as_deref())
+        && requested != expected
+    {
+        return Err(CliError::EmbeddingConfig(format!(
+            "--embedding {requested} conflicts with descriptor reference {expected}",
+        )));
+    }
+    let reference = args.embedding.clone().or(http_reference);
+    let endpoint = args.endpoint.clone().or_else(|| {
+        http_descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.endpoint.clone())
+    });
+    let embedding = reference.map(|reference| EmbeddingModelSpec {
         reference,
         revision: None,
         cache_dir: args.model_cache.clone(),
-        endpoint: args.endpoint.clone(),
+        endpoint: endpoint.clone(),
         device: args.device.unwrap_or(DeviceArg::Auto).into(),
     });
     Ok(CliPlan::Index {
@@ -1663,9 +1728,10 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             reset_paths: args.reset_paths,
             scan,
             embedding,
+            http_embedding,
             allow_remote: args.allow_remote,
             api_key: args.api_key,
-            endpoint: args.endpoint.clone(),
+            endpoint,
             device: args.device.map(Into::into),
             model_cache: args.model_cache,
             embedding_concurrency: args.embedding_concurrency,
@@ -1841,6 +1907,101 @@ mod tests {
             .expect("parse")
             .into_plan(std::env::temp_dir())
             .expect("plan")
+    }
+
+    #[test]
+    fn embedding_config_descriptor_selects_uncataloged_http_model() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let descriptor_path = directory.path().join("embedding.json");
+        std::fs::write(
+            &descriptor_path,
+            r#"{"endpoint":"http://127.0.0.1:4141/v1","embedding":{"id":"local-fixture","model":"served-model","dimension":3,"maxBatchSize":1}}"#,
+        ).expect("write descriptor");
+        let descriptor_path = descriptor_path.to_str().expect("UTF-8 path");
+        let CliPlan::Index {
+            operation: IndexOperation::Build(request),
+            ..
+        } = Cli::try_parse_from([
+            "zg",
+            "--index",
+            "--embedding-config",
+            descriptor_path,
+            "--allow-remote",
+        ])
+        .expect("CLI parse")
+        .into_plan(directory.path().to_path_buf())
+        .expect("plan")
+        else {
+            panic!("index plan")
+        };
+        let embedding = request.embedding.as_ref().expect("model selection");
+        assert!(
+            embedding
+                .reference
+                .starts_with("openai-http/local-fixture-")
+        );
+        assert_eq!(
+            embedding.endpoint.as_deref(),
+            Some("http://127.0.0.1:4141/v1")
+        );
+        assert_eq!(
+            request.http_embedding.as_ref().expect("descriptor").model,
+            "served-model"
+        );
+        assert_eq!(
+            request
+                .http_embedding
+                .as_ref()
+                .expect("descriptor")
+                .max_batch_size,
+            1
+        );
+        assert!(request.allow_remote);
+    }
+
+    #[test]
+    fn global_model_config_accepts_descriptor_with_or_without_reference() {
+        for arguments in [
+            vec![
+                "zg",
+                "--config",
+                "model",
+                "set",
+                "--embedding-config",
+                "./embedding.json",
+                "--default",
+            ],
+            vec![
+                "zg",
+                "--config",
+                "model",
+                "set",
+                "openai-http/fixture-model-deadbeef",
+                "--embedding-config",
+                "./embedding.json",
+            ],
+        ] {
+            assert!(
+                matches!(plan(&arguments), CliPlan::Config(_)),
+                "{arguments:?}"
+            );
+        }
+
+        assert!(matches!(
+            plan(&[
+                "zg",
+                "--config",
+                "model",
+                "set",
+                "--embedding-config",
+                "./embedding.json"
+            ]),
+            CliPlan::Config(_)
+        ));
+        assert!(matches!(
+            plan(&["zg", "--config", "model", "set"]),
+            CliPlan::Config(_)
+        ));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod factory;
 mod llama_cpp;
 mod model2vec;
+mod openai_http;
 mod qwen;
 mod transformers;
 
