@@ -137,9 +137,10 @@ request-purpose routing require a rebuild; retries and resource limits do not.
 
 GitHub Metis uses a provider-specific protocol, so it remains outside zg's generic
 HTTP embedding implementation. The optional [standalone Metis adapter](https://github.com/tsoernes/zg-metis-adapter)
-translates requests locally; it forwards input to GitHub and has no persistent
-embedding cache. Review its security notes and use only with independently
-authorized, synthetic test input unless you have approval for the upstream transfer.
+translates requests locally and forwards uncached input to GitHub. It persists
+validated vectors in a private seven-day SQLite cache; see its security notes
+and cache-path controls. Use only with independently authorized input; synthetic
+tests are recommended unless you have approval for the upstream transfer.
 
 ### 2. Choose how to search
 
