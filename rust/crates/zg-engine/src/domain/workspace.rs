@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,103 @@ use crate::{
 
 use super::{FileFormat, GlobRule, IndexState, SourcePath};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceStorageFormat {
+    BinarySignDiskAnnV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BinaryDiskAnnManifest {
+    format_version: u32,
+    storage_generation: String,
+    graph_path: String,
+    identity_path: String,
+    dimension: u32,
+    count: u64,
+    identity_sha256: [u8; 32],
+    trust: Vec<u8>,
+}
+
+impl BinaryDiskAnnManifest {
+    #[cfg(any(feature = "experimental-sign-scale-v1", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        storage_generation: String,
+        graph_path: String,
+        identity_path: String,
+        dimension: u32,
+        count: u64,
+        identity_sha256: [u8; 32],
+        trust: Vec<u8>,
+    ) -> EngineResult<Self> {
+        let manifest = Self {
+            format_version: 1,
+            storage_generation,
+            graph_path,
+            identity_path,
+            dimension,
+            count,
+            identity_sha256,
+            trust,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn validate(&self) -> EngineResult<()> {
+        uuid::Uuid::parse_str(&self.storage_generation).map_err(|_| {
+            EngineError::invalid_argument("binaryDiskAnn.storageGeneration must be a UUID")
+        })?;
+        let safe_relative = |value: &str| {
+            !value.is_empty()
+                && !value.as_bytes().contains(&0)
+                && !Path::new(value).is_absolute()
+                && Path::new(value)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        };
+        if self.format_version != 1
+            || !(1..=20_000).contains(&self.dimension())
+            || self.count() == 0
+            || self.identity_sha256().iter().all(|byte| *byte == 0)
+            || self.trust().is_empty()
+            || self.trust().len() > 4096
+            || !safe_relative(self.graph_path())
+            || !safe_relative(self.identity_path())
+            || self.graph_path() == self.identity_path()
+        {
+            return Err(EngineError::invalid_argument(
+                "binaryDiskAnn metadata is malformed or out of bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn storage_generation(&self) -> &str {
+        &self.storage_generation
+    }
+    pub(crate) fn graph_path(&self) -> &str {
+        &self.graph_path
+    }
+    pub(crate) fn identity_path(&self) -> &str {
+        &self.identity_path
+    }
+    pub(crate) fn dimension(&self) -> u32 {
+        self.dimension
+    }
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+    pub(crate) fn identity_sha256(&self) -> [u8; 32] {
+        self.identity_sha256
+    }
+    pub(crate) fn trust(&self) -> &[u8] {
+        &self.trust
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Workspace {
@@ -18,6 +115,12 @@ pub(crate) struct Workspace {
     scan: ScanRules,
     /// Compatibility version of the persisted index metadata and storage.
     index_version: u32,
+    /// Explicit backend discriminator for storage formats that require a
+    /// pre-recovery compatibility gate in the outer workspace manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_format: Option<WorkspaceStorageFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_diskann: Option<BinaryDiskAnnManifest>,
     /// Identifies an index build for publication, recovery, and caching.
     storage_generation: Option<String>,
     #[serde(rename = "createdTime")]
@@ -45,6 +148,8 @@ impl Workspace {
             layout,
             scan,
             index_version,
+            storage_format: None,
+            binary_diskann: None,
             storage_generation,
             created_epoch_ms,
             updated_epoch_ms,
@@ -60,10 +165,12 @@ impl Workspace {
         layout: WorkspaceLayout,
         scan: ScanRules,
         index_version: u32,
+        storage_format: Option<WorkspaceStorageFormat>,
         storage_generation: Option<String>,
         created_epoch_ms: u64,
         updated_epoch_ms: u64,
         index: IndexState,
+        binary_diskann: Option<BinaryDiskAnnManifest>,
     ) -> EngineResult<Self> {
         let changed = source_root.environment_changed();
         let mut workspace = Self {
@@ -71,6 +178,8 @@ impl Workspace {
             layout,
             scan,
             index_version,
+            storage_format,
+            binary_diskann,
             storage_generation,
             created_epoch_ms,
             updated_epoch_ms,
@@ -109,6 +218,17 @@ impl Workspace {
                 self.source_root().display(),
             )));
         }
+        if let Some(binary_diskann) = &self.binary_diskann {
+            binary_diskann.validate()?;
+            if !self.index_enabled()
+                || self.storage_format != Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+                || self.storage_generation.as_deref() != Some(binary_diskann.storage_generation())
+            {
+                return Err(EngineError::invalid_argument(
+                    "binaryDiskAnn metadata does not match the enabled storage generation",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -126,6 +246,34 @@ impl Workspace {
 
     pub(crate) fn index_version(&self) -> u32 {
         self.index_version
+    }
+
+    pub(crate) fn storage_format(&self) -> Option<WorkspaceStorageFormat> {
+        self.storage_format
+    }
+
+    pub(crate) fn with_storage_format(
+        mut self,
+        storage_format: Option<WorkspaceStorageFormat>,
+    ) -> Self {
+        if self.storage_format != storage_format {
+            self.binary_diskann = None;
+        }
+        self.storage_format = storage_format;
+        self
+    }
+
+    pub(crate) fn binary_diskann_manifest(&self) -> Option<&BinaryDiskAnnManifest> {
+        self.binary_diskann.as_ref()
+    }
+
+    pub(crate) fn with_binary_diskann_manifest(
+        mut self,
+        manifest: Option<BinaryDiskAnnManifest>,
+    ) -> EngineResult<Self> {
+        self.binary_diskann = manifest;
+        self.validate()?;
+        Ok(self)
     }
 
     pub(crate) fn storage_generation(&self) -> Option<&str> {
@@ -571,10 +719,13 @@ mod tests {
             WorkspaceLayout::new(root.join(".zvec-grep")).expect("current layout"),
             serde_json::from_value(saved["scan"].clone()).expect("scan fields"),
             serde_json::from_value(saved["indexVersion"].clone()).expect("index version"),
+            serde_json::from_value(saved["storageFormat"].clone()).expect("storage format"),
             serde_json::from_value(saved["storageGeneration"].clone()).expect("storage generation"),
             serde_json::from_value(saved["createdTime"].clone()).expect("created time"),
             serde_json::from_value(saved["updatedTime"].clone()).expect("updated time"),
             serde_json::from_value(saved["index"].clone()).expect("index fields"),
+            serde_json::from_value(saved.get("binaryDiskAnn").cloned().unwrap_or(Value::Null))
+                .expect("binary DiskANN metadata"),
         )
         .expect("workspace from manifest")
     }

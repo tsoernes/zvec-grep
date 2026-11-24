@@ -46,10 +46,19 @@ fn explicit_options(root: &Path, address: SocketAddr) -> IndexOptions {
 
 fn assert_version_diagnostic(diagnostic: &str, actual_version: Option<u32>) {
     if let Some(version) = actual_version {
-        assert!(
-            diagnostic.contains(&format!("unsupported index version {version}; expected 2")),
-            "{diagnostic}"
-        );
+        if version == 3 {
+            assert!(
+                diagnostic.contains("requires storageFormat binary_sign_disk_ann_v1"),
+                "{diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains(&format!(
+                    "unsupported index version {version}; supported versions are 2 and 3"
+                )),
+                "{diagnostic}"
+            );
+        }
         assert!(
             !diagnostic.contains("invalid workspace manifest"),
             "{diagnostic}"
@@ -90,13 +99,22 @@ async fn assert_incompatible_operations(
 ) -> TestResult {
     let root = options.root.as_deref().expect("explicit root");
     for include_status in [false, true] {
-        let info = engine
+        let result = engine
             .info(InfoOptions {
                 root: Some(root.to_path_buf()),
                 include_status,
                 include_counts: false,
             })
-            .await?;
+            .await;
+        if actual_version == Some(3) {
+            let error =
+                result.expect_err("unsupported Binary DiskANN V1 must not report compatible");
+            assert_eq!(error.code(), EngineError::UNSUPPORTED);
+            assert!(error.message().contains("binary DiskANN V1"));
+            assert_manifest_unchanged(root, manifest)?;
+            continue;
+        }
+        let info = result?;
         assert_eq!(info.index_status(), IndexStatus::RebuildRequired);
         assert!(info.status.is_none(), "incompatible storage is not scanned");
         let IndexCompatibility::RebuildRequired {
@@ -126,7 +144,11 @@ async fn assert_incompatible_operations(
             })
             .await
             .expect_err("context must not use or refresh incompatible data");
-        assert_rebuild_error(&error, actual_version);
+        if actual_version == Some(3) {
+            assert_eq!(error.code(), EngineError::UNSUPPORTED);
+        } else {
+            assert_rebuild_error(&error, actual_version);
+        }
         assert_manifest_unchanged(root, manifest)?;
     }
     let error = engine
@@ -136,14 +158,22 @@ async fn assert_incompatible_operations(
         })
         .await
         .expect_err("ordinary index must require an explicit rebuild");
-    assert_rebuild_error(&error, actual_version);
+    if actual_version == Some(3) {
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+    } else {
+        assert_rebuild_error(&error, actual_version);
+    }
     assert_manifest_unchanged(root, manifest)?;
     let error = engine
         .watch_workspace(root, &TaskControl::default())
         .await
         .err()
         .expect("watch must reject incompatible data before starting");
-    assert_rebuild_error(&error, actual_version);
+    if actual_version == Some(3) {
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+    } else {
+        assert_rebuild_error(&error, actual_version);
+    }
     assert_manifest_unchanged(root, manifest)
 }
 
@@ -238,7 +268,6 @@ async fn incompatible_versions_require_explicit_rebuild_across_public_operations
     for version in [
         Some(json!(0)),
         Some(json!(1)),
-        Some(json!(3)),
         Some(json!(4)),
         Some(json!(5)),
         None,
@@ -292,6 +321,60 @@ async fn incompatible_versions_require_explicit_rebuild_across_public_operations
         assert!(!root.join(".zvec-grep/temp/new").exists());
     }
     engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_binary_diskann_v1_is_rejected_before_status_or_rebuild_mutation() -> TestResult
+{
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    let options = explicit_options(root, server.address);
+    fs::write(root.join("note.txt"), "Orchard documentation.")?;
+    let engine = ZvecGrep::new();
+    engine.index(options.clone()).await?;
+
+    let index_path = root.join(".zvec-grep/index");
+    let native_before = native_file_records(&index_path)?;
+    let mut v1_manifest = assert_current_index(&engine, root).await?;
+    v1_manifest["indexVersion"] = json!(3);
+    v1_manifest["storageFormat"] = json!("binary_sign_disk_ann_v1");
+    v1_manifest["index"]["descriptor"]["defaultEmbeddingModel"]["vectorIndexQuantization"] =
+        json!("binary_sign_diskann_v1");
+    let manifest = serde_json::to_vec(&v1_manifest)?;
+    fs::write(root.join(".zvec-grep/manifest.json"), &manifest)?;
+    let embedding_requests = server.requests.load(Ordering::Acquire);
+
+    for include_status in [false, true] {
+        let error = engine
+            .info(InfoOptions {
+                root: Some(root.to_path_buf()),
+                include_status,
+                include_counts: false,
+            })
+            .await
+            .expect_err("unsupported V1 must not report compatible");
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+        assert_manifest_unchanged(root, &manifest)?;
+    }
+    for rebuild in [false, true] {
+        let error = engine
+            .index(IndexOptions {
+                rebuild,
+                ..options.clone()
+            })
+            .await
+            .expect_err("unsupported V1 must fail before recovery or rebuild");
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+        assert_manifest_unchanged(root, &manifest)?;
+    }
+    assert_eq!(native_file_records(&index_path)?, native_before);
+    assert!(!root.join(".zvec-grep/temp/build.json").exists());
+    assert!(!root.join(".zvec-grep/temp/new").exists());
+    assert!(!root.join(".zvec-grep/temp/old").exists());
+    assert_eq!(server.requests.load(Ordering::Acquire), embedding_requests);
     engine.close();
     Ok(())
 }
@@ -359,12 +442,10 @@ async fn unbuilt_workspaces_require_a_valid_current_version_before_initializatio
             assert!(!home.join("temp").exists());
         }
 
-        // A current uninitialized manifest follows ordinary initialization; an
-        // incompatible disabled manifest can only be replaced by explicit rebuild.
+        // Restore the valid current version after the malformed/incompatible
+        // cases above. A disabled workspace still needs explicit rebuild.
         let rebuild = state == "disabled";
-        if !rebuild {
-            fs::write(home.join("manifest.json"), serde_json::to_vec(&current)?)?;
-        }
+        fs::write(home.join("manifest.json"), serde_json::to_vec(&current)?)?;
         let indexed = engine.index(IndexOptions { rebuild, ..options }).await?;
         assert_eq!((indexed.files_added, indexed.files_failed), (1, 0));
         assert_current_index(&engine, root).await?;

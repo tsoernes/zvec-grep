@@ -32,6 +32,7 @@ use super::{
     pipeline::{RequestEmbeddingRuntime, SearchEmbeddingRuntime},
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn context(
     indexing: &WorkspaceIndexService,
     models: &ModelRuntimeManager,
@@ -122,15 +123,22 @@ pub(crate) async fn context(
         .descriptor()
         .is_some_and(IndexDescriptor::graph_indexing);
     let storage = match read_sessions {
-        Some(cache) => cache.acquire(
+        Some(cache) => cache.acquire_for_workspace_with_binary(
             &layout,
             workspace.layout().index_dir(),
             workspace
                 .storage_generation()
                 .expect("published index generation"),
             graph_enabled,
+            workspace.storage_format(),
+            workspace.binary_diskann_manifest().cloned(),
         )?,
-        None => ReadSessionLease::open(workspace.layout().index_dir(), graph_enabled)?,
+        None => ReadSessionLease::open_for_workspace_with_binary(
+            workspace.layout().index_dir(),
+            graph_enabled,
+            workspace.storage_format(),
+            workspace.binary_diskann_manifest().cloned(),
+        )?,
     };
     let result = query_storage(&acquired, &workspace, storage.storage(), options, &request).await;
     let close = storage.close();

@@ -536,6 +536,7 @@ const INDEX_HELP: &str = r"Usage:
 Index options:
   --rebuild                         Rebuild the existing index
   --graph[=true|false]               Enable or disable graph indexing; omitted keeps saved setting
+  --vector-index-quantization <mode> Use fp16 or binary-sign; experimental DiskANN requires a feature build and rebuild
   --drop                            Permanently remove the workspace index
   --debug                           Print skipped-file diagnostics to stderr
   --mode <direct|server|auto>       Select indexing transport
@@ -543,6 +544,14 @@ Index options:
 
 Graph indexing defaults to disabled for new indexes. Changing it on an existing
 index requires --rebuild, for example: zg --index --rebuild --graph.
+
+Vector indexing defaults to fp16. binary-sign stores packed document signs and
+scores them against floating-point queries; changing the mode requires --rebuild.
+
+Binary DiskANN V1 uses binary-sign-diskann-v1 and requires an
+experimental-binary-diskann build. It is an immutable workspace sidecar, not
+normal Zvec collection/WAL support. Each V1 indexing pass rebuilds the full
+staged generation so rows and graph cannot diverge.
 
 Dropping an index runs immediately without a confirmation prompt.
 

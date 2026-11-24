@@ -238,7 +238,15 @@ fn try_recover_publication(
     if !try_lock_handle(&residency, LockMode::Exclusive)? {
         return Ok(());
     }
-    crate::workspace::manifest::read_workspace_manifest(source_root, layout)?;
+    let workspace = crate::workspace::manifest::read_workspace_manifest(source_root, layout)?;
+    if workspace
+        .as_ref()
+        .is_some_and(crate::workspace::manifest::workspace_uses_binary_diskann_v1)
+    {
+        return Err(EngineError::unsupported(
+            "binary DiskANN V1 storage is not supported by this experimental build",
+        ));
+    }
     index::recover_build(layout)
 }
 

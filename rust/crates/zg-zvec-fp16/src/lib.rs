@@ -13,6 +13,19 @@ use half::f16;
 use zvec_rust::sys::{self, zvec_error_code_t};
 use zvec_rust::{Doc, Error, ErrorCode, Result, SearchQuery};
 
+pub mod packed_sign_index;
+
+/// Checked V1 packed-sign records and scoring for the experimental sidecar.
+pub mod packed_sign_scale;
+
+/// Safe adapter for the native immutable packed-DiskANN generation API.
+#[cfg(feature = "experimental-sign-scale-v1")]
+pub mod packed_diskann_generation;
+
+/// Thread-owned bridge to the immutable packed-DiskANN generation API.
+#[cfg(feature = "experimental-sign-scale-v1")]
+pub mod packed_v1_worker;
+
 /// Writes an embedding as IEEE binary16 values.
 ///
 /// # Errors
@@ -171,7 +184,8 @@ mod tests {
     use super::{add_embedding, decode_embedding, embedding_query, f16};
 
     fn initialize() {
-        zvec_rust::initialize(None).expect("initialize zvec");
+        static INITIALIZE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INITIALIZE.get_or_init(|| zvec_rust::initialize(None).expect("initialize zvec"));
     }
 
     #[test]

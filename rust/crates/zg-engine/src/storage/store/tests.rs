@@ -1,13 +1,15 @@
 use super::super::types::StoragePathFilter;
 use super::*;
 use crate::domain::SourcePath;
-use crate::domain::model::EmbeddingMetric;
+use crate::domain::model::{EmbeddingMetric, VectorIndexQuantization};
 use crate::domain::{
     CodeMetadata, Content, EdgeProvenance, Entity, EntityFragment, EntityId, EntityMetadata,
     FileGraphNode, FileGraphResult, FileRecord, FileSnapshot, FragmentId, GraphEdgeKind,
     PendingRef, PendingRefStatus, Range, SymbolType,
 };
 use crate::pipelines::indexing::graph_resolver::resolve_pending;
+
+mod binary_diskann_acceptance;
 
 /// Test input keeps canonical entities and model outputs separate, as the writer does.
 #[derive(Clone)]
@@ -435,6 +437,27 @@ fn schema() -> EmbeddingModelInfo {
         None,
     )
     .expect("valid embedding metadata")
+}
+
+#[test]
+fn v1_workspace_without_outer_trust_is_rejected_before_fragment_collection_open() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let storage = open(directory.path(), false);
+    storage.close().expect("close writer");
+
+    let result = IndexStore::open_for_workspace(
+        WorkspaceIndexStorageOptions::ReadOnly {
+            storage_path: directory.path().to_path_buf(),
+            graph_enabled: false,
+        },
+        Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1),
+    );
+    let error = result.err().expect("outer/inner mismatch must fail");
+    assert!(
+        error
+            .message()
+            .contains("binary DiskANN workspace read requires outer generation trust metadata")
+    );
 }
 
 #[test]
@@ -1702,6 +1725,38 @@ fn colliding_model_collection_names_are_rejected_before_opening_storage() {
 }
 
 #[test]
+fn binary_sign_storage_schema_is_explicit_and_legacy_readers_reject_it() {
+    let binary = schema().with_vector_index_quantization(VectorIndexQuantization::BinarySign);
+    let value = serde_json::to_value(SchemaRecord::new(&[binary.clone()]))
+        .expect("binary-sign schema JSON");
+    assert_eq!(value["binary_sign_storage"], true);
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacySchemaRecord {
+        path_encoding: String,
+        embeddings: Vec<serde_json::Value>,
+    }
+
+    assert!(serde_json::from_value::<LegacySchemaRecord>(value.clone()).is_err());
+    let current = serde_json::from_value::<SchemaRecord>(value.clone())
+        .expect("current reader accepts binary schema");
+    assert_eq!(
+        current.embeddings().expect("valid binary schema")[0].vector_index_quantization(),
+        VectorIndexQuantization::BinarySign
+    );
+
+    let mut inconsistent = value;
+    inconsistent["binary_sign_storage"] = serde_json::json!(false);
+    let error = serde_json::from_value::<SchemaRecord>(inconsistent)
+        .expect("schema fields deserialize")
+        .embeddings()
+        .expect_err("marker mismatch must fail closed");
+    assert!(error.message().contains("marker does not match"));
+}
+
+#[test]
 fn model_set_changes_require_rebuild_and_order_does_not() {
     let home = tempfile::tempdir().expect("workspace");
     open_multi_model(home.path())
@@ -1727,6 +1782,36 @@ fn model_set_changes_require_rebuild_and_order_does_not() {
             .is_err()
         );
     }
+
+    let single_model_home = tempfile::tempdir().expect("single-model workspace");
+    IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
+        storage_path: single_model_home.path().to_owned(),
+        embeddings: vec![schema()],
+    })
+    .expect("FP16 storage")
+    .close()
+    .expect("close FP16 storage");
+    let changed = schema().with_vector_index_quantization(VectorIndexQuantization::BinarySign);
+    let error = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
+        storage_path: single_model_home.path().to_owned(),
+        embeddings: vec![changed],
+    })
+    .err()
+    .expect("changing quantization requires a rebuild");
+    assert!(
+        error
+            .message()
+            .contains("vector index quantization differs")
+    );
+    IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+        graph_enabled: false,
+        storage_path: single_model_home.path().to_owned(),
+    })
+    .expect("rejected mode change leaves FP16 storage readable")
+    .close()
+    .expect("close FP16 reader");
 }
 
 #[test]

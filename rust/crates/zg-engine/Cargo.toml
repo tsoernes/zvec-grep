@@ -9,6 +9,10 @@ publish.workspace = true
 
 [features]
 default = []
+# Opt-in immutable packed-DiskANN sidecar workspace integration. The matching
+# native library must be built with ZVEC_ENABLE_PACKED_DISKANN_GENERATION_API.
+# Default binaries remain fail-closed without this feature.
+experimental-sign-scale-v1 = ["zg-zvec-fp16/experimental-sign-scale-v1"]
 # Matching CUDA builds reuse the pinned native SDK; custom CUDA/Vulkan
 # configurations require source toolchains. Runtime CPU fallback is unchanged.
 cuda = [

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EngineError, EngineResult,
     domain::{
-        Entity, EntityId, EntityMetadata, FileId, FileIndexStatus, FileRecord, Language, Range,
+        BinaryDiskAnnManifest, Entity, EntityId, EntityMetadata, FileId, FileIndexStatus,
+        FileRecord, Language, Range, VectorIndexQuantization,
     },
     utils::{
         atomic_write as write_record, directory_exists, ensure_directory, file_exists,
@@ -34,7 +35,7 @@ use super::{
     zvec::{WAL_RECOVERY_REQUIRED, corrupt, initialize, recover_collection},
 };
 use crate::domain::FileGraphResult;
-use crate::domain::model::EmbeddingModelInfo;
+use crate::domain::{WorkspaceStorageFormat, model::EmbeddingModelInfo};
 
 mod read_view;
 mod resolution;
@@ -47,6 +48,7 @@ static STORES: OnceLock<StoreRegistry> = OnceLock::new();
 struct SharedStore {
     state: Mutex<StoreState>,
     schema: Vec<EmbeddingModelInfo>,
+    binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
     read_only: bool,
     graph_enabled: bool,
     // The native handles must close before the operating-system lock is released.
@@ -80,6 +82,14 @@ pub(crate) struct IndexedSourceFile {
 #[serde(deny_unknown_fields)]
 struct SchemaRecord {
     path_encoding: PathEncoding,
+    #[serde(default, skip_serializing_if = "is_false")]
+    binary_sign_storage: bool,
+    // Future packed-binary DiskANN storage uses an explicit root-level marker
+    // in addition to the per-model enum. This inner schema is not a sufficient
+    // pre-recovery compatibility gate: workspace recovery can mutate paths
+    // before reaching IndexStore::open. None preserves existing schema JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binary_sign_diskann_storage_version: Option<u32>,
     embeddings: Vec<EmbeddingModelInfo>,
 }
 
@@ -93,11 +103,44 @@ impl SchemaRecord {
     fn new(embeddings: &[EmbeddingModelInfo]) -> Self {
         Self {
             path_encoding: PathEncoding::Components,
+            binary_sign_storage: embeddings.iter().any(|embedding| {
+                matches!(
+                    embedding.vector_index_quantization(),
+                    VectorIndexQuantization::BinarySign
+                        | VectorIndexQuantization::BinarySignDiskAnnV1
+                )
+            }),
+            binary_sign_diskann_storage_version: embeddings
+                .iter()
+                .any(|embedding| {
+                    embedding.vector_index_quantization()
+                        == VectorIndexQuantization::BinarySignDiskAnnV1
+                })
+                .then_some(1),
             embeddings: embeddings.to_vec(),
         }
     }
 
     fn embeddings(self) -> EngineResult<Vec<EmbeddingModelInfo>> {
+        let has_binary_sign_storage = self.embeddings.iter().any(|embedding| {
+            matches!(
+                embedding.vector_index_quantization(),
+                VectorIndexQuantization::BinarySign | VectorIndexQuantization::BinarySignDiskAnnV1
+            )
+        });
+        if self.binary_sign_storage != has_binary_sign_storage {
+            return Err(EngineError::storage_failure(
+                "binary-sign storage marker does not match embedding metadata",
+            ));
+        }
+        let has_binary_diskann = self.embeddings.iter().any(|embedding| {
+            embedding.vector_index_quantization() == VectorIndexQuantization::BinarySignDiskAnnV1
+        });
+        if self.binary_sign_diskann_storage_version != has_binary_diskann.then_some(1) {
+            return Err(EngineError::storage_failure(
+                "binary DiskANN storage version marker does not match embedding metadata",
+            ));
+        }
         validate_models(&self.embeddings).map_err(|error| {
             EngineError::storage_failure(format!(
                 "invalid stored embedding model information: {error}"
@@ -105,6 +148,10 @@ impl SchemaRecord {
         })?;
         Ok(self.embeddings)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn validate_models(embeddings: &[EmbeddingModelInfo]) -> EngineResult<()> {
@@ -136,15 +183,98 @@ fn validate_models(embeddings: &[EmbeddingModelInfo]) -> EngineResult<()> {
     Ok(())
 }
 
+fn validate_workspace_storage_format(
+    schema: &[EmbeddingModelInfo],
+    expected: Option<WorkspaceStorageFormat>,
+) -> EngineResult<()> {
+    let has_binary_diskann = schema.iter().any(|embedding| {
+        embedding.vector_index_quantization() == VectorIndexQuantization::BinarySignDiskAnnV1
+    });
+    let matches = match expected {
+        None => !has_binary_diskann,
+        Some(WorkspaceStorageFormat::BinarySignDiskAnnV1) => has_binary_diskann,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(EngineError::storage_failure(
+            "workspace storageFormat does not match the inner vector-index schema",
+        ))
+    }
+}
+
+pub(crate) fn validate_workspace_storage_format_at_path(
+    path: &Path,
+    expected: Option<WorkspaceStorageFormat>,
+) -> EngineResult<()> {
+    let descriptor = path.join("schema.json");
+    let schema = read_json::<SchemaRecord>(&descriptor)
+        .map_err(|error| {
+            EngineError::storage_failure(format!(
+                "unsupported or invalid storage schema: {error}; rebuild the index"
+            ))
+        })?
+        .embeddings()?;
+    validate_workspace_storage_format(&schema, expected)
+}
+
 impl IndexStore {
     /// Whether indexing can persist extracted graphs in this store.
     pub(crate) fn graph_enabled(&self) -> bool {
         self.read(|state| Ok(state.graph.is_ok())).unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(options: WorkspaceIndexStorageOptions) -> EngineResult<Self> {
+        Self::open_inner(options, false, None, None)
+    }
+
+    pub(crate) fn open_for_workspace(
+        options: WorkspaceIndexStorageOptions,
+        expected_storage_format: Option<WorkspaceStorageFormat>,
+    ) -> EngineResult<Self> {
+        Self::open_inner(options, true, expected_storage_format, None)
+    }
+
+    pub(crate) fn open_for_workspace_with_binary_diskann(
+        options: WorkspaceIndexStorageOptions,
+        expected_storage_format: Option<WorkspaceStorageFormat>,
+        binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
+    ) -> EngineResult<Self> {
+        Self::open_inner(
+            options,
+            true,
+            expected_storage_format,
+            binary_diskann_manifest,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_inner(
+        options: WorkspaceIndexStorageOptions,
+        enforce_workspace_format: bool,
+        expected_storage_format: Option<WorkspaceStorageFormat>,
+        binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
+    ) -> EngineResult<Self> {
         let graph_enabled = options.graph_enabled();
+        if !enforce_workspace_format
+            && matches!(
+                &options,
+                WorkspaceIndexStorageOptions::ReadWrite { embeddings, .. }
+                    if embeddings.iter().any(|embedding| {
+                        embedding.vector_index_quantization()
+                            == VectorIndexQuantization::BinarySignDiskAnnV1
+                    })
+            )
+        {
+            return Err(EngineError::unsupported(
+                "binary DiskANN V1 requires a generation-pinned workspace manifest",
+            ));
+        }
         if let WorkspaceIndexStorageOptions::ReadWrite { embeddings, .. } = &options {
+            if enforce_workspace_format {
+                validate_workspace_storage_format(embeddings, expected_storage_format)?;
+            }
             validate_models(embeddings)?;
         }
         initialize()?;
@@ -155,6 +285,24 @@ impl IndexStore {
             ));
         }
         let read_only = options.is_read_only();
+        if binary_diskann_manifest.is_some()
+            && (!enforce_workspace_format
+                || expected_storage_format != Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+                || !read_only)
+        {
+            return Err(EngineError::invalid_argument(
+                "binaryDiskAnn trust metadata is valid only for a read-only V1 workspace open",
+            ));
+        }
+        if read_only
+            && enforce_workspace_format
+            && expected_storage_format == Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+            && binary_diskann_manifest.is_none()
+        {
+            return Err(EngineError::storage_failure(
+                "binary DiskANN workspace read requires outer generation trust metadata",
+            ));
+        }
         let outer = home
             .file_name()
             .and_then(|_| home.parent())
@@ -168,7 +316,24 @@ impl IndexStore {
             .map_err(|error| io_error("locate index directory", home, &error))?;
         let mut registry = registry()?;
         if let Some(shared) = registry.get(&path).and_then(Weak::upgrade) {
-            if read_only && shared.read_only && graph_enabled == shared.graph_enabled {
+            if !enforce_workspace_format
+                && shared.schema.iter().any(|embedding| {
+                    embedding.vector_index_quantization()
+                        == VectorIndexQuantization::BinarySignDiskAnnV1
+                })
+            {
+                return Err(EngineError::unsupported(
+                    "binary DiskANN V1 requires a generation-pinned workspace manifest",
+                ));
+            }
+            if read_only
+                && shared.read_only
+                && graph_enabled == shared.graph_enabled
+                && shared.binary_diskann_manifest == binary_diskann_manifest
+            {
+                if enforce_workspace_format {
+                    validate_workspace_storage_format(&shared.schema, expected_storage_format)?;
+                }
                 return Ok(Self {
                     shared: Mutex::new(Some(shared)),
                     read_only,
@@ -179,6 +344,19 @@ impl IndexStore {
             ));
         }
         let (mut lock, mut schema, new_storage) = prepare_storage(&path, options.clone())?;
+        if !enforce_workspace_format
+            && schema.iter().any(|embedding| {
+                embedding.vector_index_quantization()
+                    == VectorIndexQuantization::BinarySignDiskAnnV1
+            })
+        {
+            return Err(EngineError::unsupported(
+                "binary DiskANN V1 requires a generation-pinned workspace manifest",
+            ));
+        }
+        if enforce_workspace_format {
+            validate_workspace_storage_format(&schema, expected_storage_format)?;
+        }
         let optimize_marker = path.join("optimize.pending");
         let needs_optimize = file_exists(&optimize_marker)?;
         let graph_path = path.join("graph").join("graph.sqlite");
@@ -207,12 +385,15 @@ impl IndexStore {
             Err(graph_disabled())
         }
         .map_err(EngineError::into_report);
-        let tables = open_tables(&path, &schema, read_only);
+        let tables = open_tables(&path, &schema, read_only, binary_diskann_manifest.as_ref());
         let (files, directories, entities, fragments) = match tables {
             Err(error) if read_only && error.code() == WAL_RECOVERY_REQUIRED => {
                 // open_tables has dropped every partial native reader.
                 (lock, schema) = recover_wal(&path, options, lock)?;
-                open_tables(&path, &schema, true)?
+                if enforce_workspace_format {
+                    validate_workspace_storage_format(&schema, expected_storage_format)?;
+                }
+                open_tables(&path, &schema, true, binary_diskann_manifest.as_ref())?
             }
             result => result?,
         };
@@ -238,6 +419,7 @@ impl IndexStore {
                 closed: false,
             }),
             schema,
+            binary_diskann_manifest,
             read_only,
             graph_enabled,
             _lock: lock,
@@ -526,6 +708,24 @@ impl IndexStore {
         })
     }
 
+    #[cfg(feature = "experimental-sign-scale-v1")]
+    pub(crate) fn build_binary_diskann(
+        &self,
+        staged_index_root: &Path,
+        storage_generation: &str,
+    ) -> EngineResult<BinaryDiskAnnManifest> {
+        if self.read_only {
+            return Err(EngineError::invalid_argument(
+                "cannot build binary DiskANN through a read-only index store",
+            ));
+        }
+        self.write(|state| {
+            state
+                .fragments
+                .build_binary_diskann(staged_index_root, storage_generation)
+        })
+    }
+
     fn finalize_writes_with(
         &self,
         optimize: impl FnOnce(&mut StoreState) -> EngineResult<()>,
@@ -582,12 +782,18 @@ fn open_tables(
     path: &Path,
     schema: &[EmbeddingModelInfo],
     read_only: bool,
+    binary_diskann_manifest: Option<&BinaryDiskAnnManifest>,
 ) -> EngineResult<(Files, Directories, Entities, Fragments)> {
     Ok((
         Files::open(path, read_only)?,
         Directories::open(path, read_only)?,
         Entities::open(path, read_only)?,
-        Fragments::open(path, schema, read_only)?,
+        Fragments::open_with_binary_diskann_manifest(
+            path,
+            schema,
+            read_only,
+            binary_diskann_manifest,
+        )?,
     ))
 }
 
@@ -664,7 +870,13 @@ fn replace_file(
     let directories = state.directories.ensure(file.relative_path())?;
     // Encode every projection before removing any of the previous file's data.
     let entity_docs = Entities::prepare(entities)?;
-    let fragment_docs = Fragments::prepare(file, entities, entries, &directories)?;
+    let fragment_docs = Fragments::prepare(
+        file,
+        entities,
+        entries,
+        &directories,
+        state.fragments.embedding_models(),
+    )?;
     let old_ids = invalidation_entity_ids(state, file.id())?;
     let mut unfinished = file.clone();
     unfinished.set_index_status(FileIndexStatus::NotIndexed)?;
@@ -896,7 +1108,7 @@ fn load_schema(
                             "embedding model set changed; rebuild the index",
                         )
                     })?;
-                stored.ensure_index_compatible(current).map_err(|error| {
+                stored.ensure_storage_compatible(current).map_err(|error| {
                     error.with_help("Rebuild the index with `zg --index --rebuild`.")
                 })?;
             }

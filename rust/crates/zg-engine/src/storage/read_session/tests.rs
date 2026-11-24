@@ -659,14 +659,21 @@ fn cold_open_does_not_block_another_workspaces_cache_hit() {
             let _home =
                 acquire_workspace_lock(&cold.layout, LockMode::Shared, "cold").expect("reader");
             cache
-                .acquire_with(&cold.layout, &cold.storage_home, "initial", || {
-                    started.send(()).expect("opening");
-                    released.recv().expect("allow native open");
-                    IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-                        graph_enabled: false,
-                        storage_path: cold.storage_home.clone(),
-                    })
-                })
+                .acquire_with(
+                    &cold.layout,
+                    &cold.storage_home,
+                    "initial",
+                    None,
+                    None,
+                    || {
+                        started.send(()).expect("opening");
+                        released.recv().expect("allow native open");
+                        IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+                            graph_enabled: false,
+                            storage_path: cold.storage_home.clone(),
+                        })
+                    },
+                )
                 .expect("cold query");
         });
         opening.recv().expect("cold open in progress");

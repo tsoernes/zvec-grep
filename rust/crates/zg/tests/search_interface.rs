@@ -19,7 +19,7 @@ fn command_shaped_queries_warn_once_and_still_search() {
     let root = tempfile::tempdir().expect("workspace");
     std::fs::write(
         root.path().join("source.txt"),
-        "query\nsearch\nindex\nstatus\ninstall\nuninstall\nconfig\nauth\nserver\nhelp\nversion\n",
+        "query search index status install uninstall config auth server help version",
     )
     .expect("fixture");
     for word in [
@@ -39,22 +39,20 @@ fn command_shaped_queries_warn_once_and_still_search() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{word}: {stderr}");
-        assert_eq!(stderr.matches("Warning:").count(), 1, "{stderr}");
-        let message = format!("`{word}` is not a subcommand; the search text is \"{word}\".");
-        assert!(stderr.contains(&message), "{stderr}");
-        if matches!(word, "query" | "search") {
+        let expected_warnings = usize::from(word == "search");
+        assert_eq!(
+            stderr.matches("Warning:").count(),
+            expected_warnings,
+            "{word}: {stderr}"
+        );
+        if word == "search" {
+            assert!(stderr.contains("is not a subcommand"), "{stderr}");
+            assert!(stderr.contains("search text is \"search\""), "{stderr}");
             assert_eq!(stderr.trim_end().lines().count(), 1, "{stderr}");
         } else {
-            assert_eq!(stderr.trim_end().lines().count(), 2, "{stderr}");
-            assert!(stderr.contains(&format!("`zg --{word}`")), "{stderr}");
+            assert!(stderr.trim().is_empty(), "{word}: {stderr}");
         }
-        if word == "index" {
-            assert!(
-                stderr.contains("To build the index, use `zg --index`."),
-                "{stderr}"
-            );
-        }
-        assert!(!stderr.contains('\u{1b}'), "{stderr}");
+        assert!(!stderr.contains(char::from(27)), "{stderr}");
         assert!(stdout.contains("source.txt"), "{stdout}");
         assert!(stdout.contains(word), "{stdout}");
         assert!(!stdout.contains("Warning:"), "{stdout}");
@@ -129,7 +127,11 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
         if arguments[0] == "index" {
-            assert!(stderr.contains("`zg --index`"), "{stderr}");
+            assert!(
+                stderr.contains("unexpected argument '--yes'")
+                    && stderr.contains("Usage: zg --index --drop"),
+                "{stderr}"
+            );
         }
         if arguments[0] == "--human" {
             assert!(stderr.contains("--human has been removed"), "{stderr}");

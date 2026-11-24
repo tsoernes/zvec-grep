@@ -1,3 +1,9 @@
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
+
 use sha2::{Digest, Sha256};
 
 pub(crate) fn sha256_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
@@ -10,6 +16,20 @@ pub(crate) fn sha256_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     sha256_hex_parts([bytes])
+}
+
+pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024].into_boxed_slice();
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
 }
 
 pub(crate) fn sha256_hex_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {

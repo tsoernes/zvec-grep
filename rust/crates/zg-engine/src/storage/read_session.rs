@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     EngineError, EngineResult,
-    domain::WorkspaceLayout,
+    domain::{BinaryDiskAnnManifest, WorkspaceLayout, WorkspaceStorageFormat},
     workspace::lock::{LockGuard, LockMode, can_retain_read_cache, try_acquire_file_lock},
 };
 
@@ -61,6 +61,8 @@ struct ReadSession {
     storage: IndexStore,
     storage_home: PathBuf,
     generation: String,
+    storage_format: Option<WorkspaceStorageFormat>,
+    binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
     _residency: Option<LockGuard>,
 }
 
@@ -104,6 +106,7 @@ impl ReadSessionCache {
     /// The caller holds the workspace read lock throughout the lease.
     /// `graph_enabled` comes from the published descriptor; changing it requires
     /// a rebuild, so the generation also identifies the graph configuration.
+    #[cfg(test)]
     pub(crate) fn acquire(
         &self,
         layout: &WorkspaceLayout,
@@ -111,12 +114,55 @@ impl ReadSessionCache {
         generation: &str,
         graph_enabled: bool,
     ) -> EngineResult<ReadSessionLease> {
-        self.acquire_with(layout, storage_home, generation, || {
-            IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-                graph_enabled,
-                storage_path: storage_home.to_path_buf(),
-            })
-        })
+        self.acquire_for_workspace(layout, storage_home, generation, graph_enabled, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_for_workspace(
+        &self,
+        layout: &WorkspaceLayout,
+        storage_home: &Path,
+        generation: &str,
+        graph_enabled: bool,
+        storage_format: Option<WorkspaceStorageFormat>,
+    ) -> EngineResult<ReadSessionLease> {
+        self.acquire_for_workspace_with_binary(
+            layout,
+            storage_home,
+            generation,
+            graph_enabled,
+            storage_format,
+            None,
+        )
+    }
+
+    pub(crate) fn acquire_for_workspace_with_binary(
+        &self,
+        layout: &WorkspaceLayout,
+        storage_home: &Path,
+        generation: &str,
+        graph_enabled: bool,
+        storage_format: Option<WorkspaceStorageFormat>,
+        binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
+    ) -> EngineResult<ReadSessionLease> {
+        let open_manifest = binary_diskann_manifest.clone();
+        self.acquire_with(
+            layout,
+            storage_home,
+            generation,
+            storage_format,
+            binary_diskann_manifest,
+            move || {
+                IndexStore::open_for_workspace_with_binary_diskann(
+                    WorkspaceIndexStorageOptions::ReadOnly {
+                        graph_enabled,
+                        storage_path: storage_home.to_path_buf(),
+                    },
+                    storage_format,
+                    open_manifest,
+                )
+            },
+        )
     }
 
     fn acquire_with(
@@ -124,6 +170,8 @@ impl ReadSessionCache {
         layout: &WorkspaceLayout,
         storage_home: &Path,
         generation: &str,
+        storage_format: Option<WorkspaceStorageFormat>,
+        binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
         open: impl FnOnce() -> EngineResult<IndexStore>,
     ) -> EngineResult<ReadSessionLease> {
         let slot = {
@@ -149,7 +197,10 @@ impl ReadSessionCache {
             ));
         }
         if entry.as_ref().is_some_and(|entry| {
-            entry.session.storage_home != storage_home || entry.session.generation != generation
+            entry.session.storage_home != storage_home
+                || entry.session.generation != generation
+                || entry.session.storage_format != storage_format
+                || entry.session.binary_diskann_manifest != binary_diskann_manifest
         }) {
             entry.take();
         }
@@ -166,6 +217,8 @@ impl ReadSessionCache {
                     storage,
                     storage_home: storage_home.to_path_buf(),
                     generation: generation.to_owned(),
+                    storage_format,
+                    binary_diskann_manifest,
                     _residency: Some(residency),
                 }),
                 last_used: Instant::now(),
@@ -273,15 +326,26 @@ impl CacheInner {
 }
 
 impl ReadSessionLease {
-    pub(crate) fn open(storage_home: &Path, graph_enabled: bool) -> EngineResult<Self> {
+    pub(crate) fn open_for_workspace_with_binary(
+        storage_home: &Path,
+        graph_enabled: bool,
+        storage_format: Option<WorkspaceStorageFormat>,
+        binary_diskann_manifest: Option<BinaryDiskAnnManifest>,
+    ) -> EngineResult<Self> {
         Ok(Self {
             session: Arc::new(ReadSession {
-                storage: IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-                    graph_enabled,
-                    storage_path: storage_home.to_path_buf(),
-                })?,
+                storage: IndexStore::open_for_workspace_with_binary_diskann(
+                    WorkspaceIndexStorageOptions::ReadOnly {
+                        graph_enabled,
+                        storage_path: storage_home.to_path_buf(),
+                    },
+                    storage_format,
+                    binary_diskann_manifest.clone(),
+                )?,
                 storage_home: storage_home.to_path_buf(),
                 generation: String::new(),
+                storage_format,
+                binary_diskann_manifest,
                 _residency: None,
             }),
             cache: Weak::new(),

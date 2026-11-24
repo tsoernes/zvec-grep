@@ -5,13 +5,13 @@ use std::{fs, path::Path};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::manifest::write_workspace_manifest;
+use super::manifest::{read_workspace_manifest, write_workspace_manifest};
 use crate::{
     EngineError,
-    domain::{Workspace, WorkspaceLayout},
+    domain::{BinaryDiskAnnManifest, Workspace, WorkspaceLayout},
     storage::IndexStore,
     utils::{
-        atomic_write, directory_exists, ensure_directory, reject_symlink, sha256_hex,
+        atomic_write, directory_exists, ensure_directory, reject_symlink, sha256_file, sha256_hex,
         sync_directory,
     },
 };
@@ -28,11 +28,12 @@ struct BuildRecord {
 
 impl BuildRecord {
     fn validate(&self) -> Result<(), EngineError> {
-        if self.index_version != super::CURRENT_INDEX_VERSION {
+        if !super::is_supported_index_version(self.index_version) {
             return Err(EngineError::storage_failure(format!(
-                "unsupported workspace build index version {}; expected {}",
+                "unsupported workspace build index version {}; supported versions are {} and {}",
                 self.index_version,
                 super::CURRENT_INDEX_VERSION,
+                super::BINARY_DISKANN_INDEX_VERSION,
             )));
         }
         if Uuid::parse_str(&self.generation).is_err() {
@@ -82,6 +83,16 @@ fn recover_build_with(
         Err(error) => return Err(error),
     };
     if is_committed(layout, &record)? {
+        let source_root = layout.storage_dir().parent().ok_or_else(|| {
+            EngineError::storage_failure("workspace storage directory has no source-root parent")
+        })?;
+        let workspace = read_workspace_manifest(source_root, layout)?.ok_or_else(|| {
+            EngineError::storage_failure("committed workspace manifest is missing")
+        })?;
+        crate::storage::validate_workspace_storage_format_at_path(
+            layout.index_dir(),
+            workspace.storage_format(),
+        )?;
         delete_storage(layout.backup_index_dir())?;
     } else if record.publishing {
         let current = read_optional(layout.manifest_path())?;
@@ -119,7 +130,7 @@ pub(crate) fn prepare_build(target: &Workspace) -> Result<(), EngineError> {
         ));
     }
     let record = BuildRecord {
-        index_version: super::CURRENT_INDEX_VERSION,
+        index_version: target.index_version(),
         generation: generation.to_owned(),
         previous_manifest: read_optional(target.layout().manifest_path())?
             .as_deref()
@@ -163,24 +174,90 @@ fn publish_build_with(
 ) -> Result<(), EngineError> {
     build.record_update(updated_time);
     let layout = build.layout();
-    let result = begin_publication(&build).and_then(|()| {
-        if directory_exists(build.layout().index_dir())? {
-            move_index(build.layout().index_dir(), layout.backup_index_dir())?;
-        }
-        move_index(
-            build.layout().staged_index_dir(),
-            build.layout().index_dir(),
-        )?;
-        // Only this atomic file replacement commits the new generation.
-        let bytes = fs::read(layout.staged_manifest_path()).map_err(build_io)?;
-        atomic_write(layout.manifest_path(), &bytes)
-    });
+    let result = build
+        .storage_format()
+        .map_or(Ok(()), |format| {
+            crate::storage::validate_workspace_storage_format_at_path(
+                layout.staged_index_dir(),
+                Some(format),
+            )
+        })
+        .and_then(|()| {
+            if let Some(metadata) = build.binary_diskann_manifest() {
+                validate_binary_diskann_bundle(layout.staged_index_dir(), metadata)
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| begin_publication(&build))
+        .and_then(|()| {
+            if directory_exists(build.layout().index_dir())? {
+                move_index(build.layout().index_dir(), layout.backup_index_dir())?;
+            }
+            move_index(
+                build.layout().staged_index_dir(),
+                build.layout().index_dir(),
+            )?;
+            // Only this atomic file replacement commits the new generation.
+            let bytes = fs::read(layout.staged_manifest_path()).map_err(build_io)?;
+            atomic_write(layout.manifest_path(), &bytes)
+        });
     if let Err(error) = result {
         let _ = discard_build(&build);
         return Err(error);
     }
     // Keep the record if cleanup fails, so the next writer can finish it.
     let _ = recover_build_with(layout, false, delete_storage);
+    Ok(())
+}
+
+fn validate_binary_diskann_bundle(
+    index_root: &Path,
+    metadata: &BinaryDiskAnnManifest,
+) -> Result<(), EngineError> {
+    const MAX_IDENTITY_BYTES: u64 = 256 * 1024 * 1024;
+
+    reject_symlink(index_root)?;
+    let canonical_root = fs::canonicalize(index_root).map_err(build_io)?;
+    let graph_path = index_root.join(metadata.graph_path());
+    let identity_path = index_root.join(metadata.identity_path());
+    reject_symlink(&graph_path)?;
+    reject_symlink(&identity_path)?;
+
+    let graph_metadata = fs::symlink_metadata(&graph_path).map_err(build_io)?;
+    if graph_metadata.file_type().is_symlink() || !graph_metadata.is_dir() {
+        return Err(EngineError::storage_failure(
+            "binary DiskANN graph path is not a regular directory",
+        ));
+    }
+    let canonical_graph = fs::canonicalize(&graph_path).map_err(build_io)?;
+    if !canonical_graph.starts_with(&canonical_root) {
+        return Err(EngineError::storage_failure(
+            "binary DiskANN graph path escapes the staged index",
+        ));
+    }
+
+    let identity_metadata = fs::symlink_metadata(&identity_path).map_err(build_io)?;
+    if identity_metadata.file_type().is_symlink()
+        || !identity_metadata.is_file()
+        || identity_metadata.len() > MAX_IDENTITY_BYTES
+    {
+        return Err(EngineError::storage_failure(
+            "binary DiskANN identity path is not a bounded regular file",
+        ));
+    }
+    let canonical_identity = fs::canonicalize(&identity_path).map_err(build_io)?;
+    if !canonical_identity.starts_with(&canonical_root) {
+        return Err(EngineError::storage_failure(
+            "binary DiskANN identity path escapes the staged index",
+        ));
+    }
+    let digest = sha256_file(&canonical_identity).map_err(build_io)?;
+    if digest != metadata.identity_sha256() {
+        return Err(EngineError::storage_failure(
+            "binary DiskANN identity digest does not match the outer manifest",
+        ));
+    }
     Ok(())
 }
 
@@ -274,16 +351,36 @@ fn decode_build(bytes: &[u8]) -> Result<BuildRecord, EngineError> {
 
 fn is_committed(layout: &WorkspaceLayout, build: &BuildRecord) -> Result<bool, EngineError> {
     let bytes = read_optional(layout.manifest_path())?;
-    let generation = bytes
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .and_then(|value| {
-            value
-                .get("storageGeneration")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
-    Ok(generation.as_deref() == Some(&build.generation))
+    if bytes.as_deref().map(sha256_hex) == build.previous_manifest {
+        // The manifest is still byte-for-byte the recorded pre-publication
+        // state. It may be malformed; recovery can still safely restore its
+        // matching backup without interpreting it as the committed generation.
+        return Ok(false);
+    }
+    let source_root = layout.storage_dir().parent().ok_or_else(|| {
+        EngineError::storage_failure("workspace storage directory has no source-root parent")
+    })?;
+    let Some(manifest) = read_workspace_manifest(source_root, layout)? else {
+        return Ok(false);
+    };
+    if manifest.storage_generation() != Some(build.generation.as_str()) {
+        return Ok(false);
+    }
+    let expected_format = match build.index_version {
+        super::CURRENT_INDEX_VERSION => None,
+        super::BINARY_DISKANN_INDEX_VERSION => {
+            Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        }
+        _ => unreachable!("build records validate their index version before use"),
+    };
+    if manifest.index_version() != build.index_version
+        || manifest.storage_format() != expected_format
+    {
+        return Err(EngineError::storage_failure(
+            "workspace build record format does not match the committed manifest generation",
+        ));
+    }
+    Ok(true)
 }
 
 fn write_record(layout: &WorkspaceLayout, record: &BuildRecord) -> Result<(), EngineError> {
@@ -393,15 +490,124 @@ mod tests {
         .expect("manifest")
     }
 
+    fn binary_diskann_workspace(base: &Workspace) -> Workspace {
+        let generation = Uuid::new_v4().to_string();
+        let target = Workspace::new(
+            base.source_root(),
+            base.layout().clone(),
+            base.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            Some(generation.clone()),
+            base.created_epoch_ms(),
+            base.updated_epoch_ms(),
+            binary_diskann_index(base.index()),
+        )
+        .expect("version three target")
+        .with_storage_format(Some(
+            crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1,
+        ));
+        let dimension = u32::try_from(
+            target
+                .index()
+                .descriptor()
+                .expect("descriptor")
+                .default_embedding_model()
+                .dimension(),
+        )
+        .expect("dimension");
+        let identity = binary_diskann_identity(&generation, dimension);
+        let identity_digest = crate::utils::sha256_parts([identity.as_slice()]);
+        let mut trust = Vec::with_capacity(300);
+        trust.extend_from_slice(b"ZGV1TRST");
+        trust.extend_from_slice(&1_u32.to_le_bytes());
+        trust.extend_from_slice(&dimension.to_le_bytes());
+        trust.extend_from_slice(&1_u32.to_le_bytes());
+        trust.extend_from_slice(&1_u64.to_le_bytes());
+        trust.extend_from_slice(Uuid::parse_str(&generation).expect("generation").as_bytes());
+        for digest in 1_u8..=8 {
+            trust.extend_from_slice(&[digest; 32]);
+        }
+        let metadata = BinaryDiskAnnManifest::new(
+            generation,
+            "binary-diskann/graph".to_owned(),
+            "binary-diskann/identity.bin".to_owned(),
+            dimension,
+            1,
+            identity_digest,
+            trust,
+        )
+        .expect("test metadata");
+        target
+            .with_binary_diskann_manifest(Some(metadata))
+            .expect("bind metadata to generation")
+    }
+
+    fn binary_diskann_identity(generation: &str, dimension: u32) -> Vec<u8> {
+        let mut bytes = b"ZGIDV1\0\0".to_vec();
+        bytes.extend_from_slice(Uuid::parse_str(generation).expect("generation").as_bytes());
+        bytes.extend_from_slice(&dimension.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&5_u64.to_le_bytes());
+        bytes.extend_from_slice(b"doc-1");
+        bytes
+    }
+
+    fn write_binary_diskann_bundle(workspace: &Workspace, root: &Path) {
+        if let Some(metadata) = workspace.binary_diskann_manifest() {
+            let graph = root.join(metadata.graph_path());
+            fs::create_dir_all(&graph).expect("binary graph directory");
+            fs::write(graph.join("graph.zvec"), b"fixture graph").expect("graph bytes");
+            let identity = root.join(metadata.identity_path());
+            fs::create_dir_all(identity.parent().expect("identity parent"))
+                .expect("identity directory");
+            fs::write(
+                identity,
+                binary_diskann_identity(metadata.storage_generation(), metadata.dimension()),
+            )
+            .expect("identity bytes");
+        }
+    }
+
     fn write_active(manifest: &Workspace) {
         fs::create_dir_all(manifest.layout().index_dir()).expect("active storage");
         fs::write(manifest.layout().index_dir().join("old"), "old data").expect("old data");
+        write_test_schema(manifest, manifest.layout().index_dir());
+        write_binary_diskann_bundle(manifest, manifest.layout().index_dir());
         write_workspace_manifest(manifest.layout().manifest_path(), manifest)
             .expect("active manifest");
     }
 
+    fn write_test_schema(workspace: &Workspace, storage_path: &Path) {
+        let descriptor = workspace.index().descriptor().expect("index descriptor");
+        let mut embeddings = vec![descriptor.default_embedding_model().clone()];
+        embeddings.extend(descriptor.embedding_routes().values().cloned());
+        let binary_storage = embeddings.iter().any(|embedding| {
+            matches!(
+                embedding.vector_index_quantization(),
+                crate::domain::VectorIndexQuantization::BinarySign
+                    | crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1
+            )
+        });
+        let diskann_v1 = embeddings.iter().any(|embedding| {
+            embedding.vector_index_quantization()
+                == crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1
+        });
+        let schema = serde_json::json!({
+            "path_encoding": "components",
+            "binary_sign_storage": binary_storage,
+            "binary_sign_diskann_storage_version": diskann_v1.then_some(1),
+            "embeddings": embeddings,
+        });
+        fs::write(
+            storage_path.join("schema.json"),
+            serde_json::to_vec(&schema).expect("test schema JSON"),
+        )
+        .expect("test schema");
+    }
+
     fn build_target(active: &Workspace) -> Workspace {
-        Workspace::new(
+        let build = Workspace::new(
             active.source_root(),
             active.layout().clone(),
             active.scan().clone(),
@@ -412,11 +618,53 @@ mod tests {
             active.index().clone(),
         )
         .expect("build target")
+        .with_storage_format(active.storage_format());
+        if active.storage_format()
+            == Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        {
+            binary_diskann_workspace(&build)
+        } else {
+            build
+        }
+    }
+
+    fn binary_diskann_index(index: &IndexState) -> IndexState {
+        let descriptor = index.descriptor().expect("enabled fixture index");
+        let default = descriptor
+            .default_embedding_model()
+            .clone()
+            .with_vector_index_quantization(
+                crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1,
+            );
+        let routes = descriptor
+            .embedding_routes()
+            .iter()
+            .map(|(kind, embedding)| {
+                (
+                    *kind,
+                    embedding.clone().with_vector_index_quantization(
+                        crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1,
+                    ),
+                )
+            })
+            .collect();
+        IndexState::Enabled(Box::new(
+            IndexDescriptor::new(
+                default,
+                routes,
+                descriptor.embedding_configs().clone(),
+                descriptor.graph_indexing(),
+                descriptor.fts(),
+            )
+            .expect("binary DiskANN descriptor"),
+        ))
     }
 
     fn stage(active: &Workspace) -> Workspace {
         let build = build_target(active);
         prepare_build(&build).expect("stage");
+        write_test_schema(&build, build.layout().staged_index_dir());
+        write_binary_diskann_bundle(&build, build.layout().staged_index_dir());
         fs::write(build.layout().staged_index_dir().join("new"), "new data").expect("new data");
         build
     }
@@ -695,7 +943,10 @@ mod tests {
             "\"indexVersion\":1.5,".to_owned(),
             format!("\"indexVersion\":{},", u64::from(u32::MAX) + 1),
             format!("\"indexVersion\":{},", current - 1),
-            format!("\"indexVersion\":{},", current + 1),
+            format!(
+                "\"indexVersion\":{},",
+                super::super::BINARY_DISKANN_INDEX_VERSION + 1
+            ),
             format!("\"indexVersion\":{current},\"indexVersion\":{current},"),
             format!(
                 "\"indexVersion\":{},\"indexVersion\":{current},",
@@ -728,7 +979,7 @@ mod tests {
     fn unsupported_build_versions_never_discard_a_possible_backup() {
         for version in [
             super::super::CURRENT_INDEX_VERSION - 1,
-            super::super::CURRENT_INDEX_VERSION + 1,
+            super::super::BINARY_DISKANN_INDEX_VERSION + 1,
         ] {
             let directory = tempdir().expect("workspace");
             let active = manifest(directory.path());
@@ -749,6 +1000,371 @@ mod tests {
             assert!(layout.backup_index_dir().join("old").exists());
             assert!(layout.has_build_record().expect("build record"));
         }
+    }
+
+    #[test]
+    fn binary_diskann_build_record_version_is_supported() {
+        let record = BuildRecord {
+            index_version: super::super::BINARY_DISKANN_INDEX_VERSION,
+            generation: uuid::Uuid::nil().to_string(),
+            previous_manifest: None,
+            had_index: false,
+            publishing: false,
+        };
+        record.validate().expect("V3 build record is supported");
+    }
+
+    #[test]
+    fn a_matching_generation_with_a_different_manifest_version_is_not_committed() {
+        let directory = tempdir().expect("workspace");
+        let base = manifest(directory.path());
+        let generation = Uuid::new_v4().to_string();
+        let active = Workspace::new(
+            base.source_root(),
+            base.layout().clone(),
+            base.scan().clone(),
+            super::super::CURRENT_INDEX_VERSION,
+            Some(generation.clone()),
+            base.created_epoch_ms(),
+            base.updated_epoch_ms(),
+            base.index().clone(),
+        )
+        .expect("version two workspace");
+        write_active(&active);
+        fs::create_dir_all(active.layout().backup_index_dir()).expect("backup directory");
+        fs::write(
+            active.layout().backup_index_dir().join("sentinel"),
+            b"prior generation",
+        )
+        .expect("backup sentinel");
+        let record = BuildRecord {
+            index_version: super::super::BINARY_DISKANN_INDEX_VERSION,
+            generation,
+            previous_manifest: Some(sha256_hex(b"different prior manifest")),
+            had_index: true,
+            publishing: true,
+        };
+        write_record(active.layout(), &record).expect("build record");
+
+        assert!(needs_recovery(active.layout()).is_err());
+        assert!(recover_build(active.layout()).is_err());
+        assert_eq!(
+            fs::read(active.layout().backup_index_dir().join("sentinel"))
+                .expect("preserved backup"),
+            b"prior generation",
+        );
+        assert!(active.layout().index_dir().join("old").is_file());
+    }
+
+    #[test]
+    fn duplicate_manifest_version_keys_do_not_discard_the_backup() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let build = stage(&active);
+        begin_publication(&build).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move old index to backup");
+        let staged = fs::read(active.layout().staged_manifest_path()).expect("staged manifest");
+        let staged = String::from_utf8(staged).expect("UTF-8 manifest");
+        let duplicate = staged.replacen(
+            "\"indexVersion\": 2,",
+            "\"indexVersion\": 2,\"indexVersion\": 2,",
+            1,
+        );
+        assert_ne!(duplicate, staged, "fixture must contain the version key");
+        fs::write(active.layout().manifest_path(), duplicate).expect("duplicate-key manifest");
+
+        assert!(needs_recovery(active.layout()).is_err());
+        assert!(recover_build(active.layout()).is_err());
+        assert!(active.layout().backup_index_dir().join("old").is_file());
+        assert!(!active.layout().index_dir().exists());
+    }
+
+    #[test]
+    fn duplicate_storage_format_keys_do_not_discard_the_backup() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let target = binary_diskann_workspace(&active);
+        prepare_build(&target).expect("stage version three publication");
+        fs::write(target.layout().staged_index_dir().join("new"), "new format")
+            .expect("staged marker");
+        begin_publication(&target).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move old index to backup");
+        let staged = fs::read(active.layout().staged_manifest_path()).expect("staged manifest");
+        let staged = String::from_utf8(staged).expect("UTF-8 manifest");
+        let duplicate = staged.replacen(
+            "\"storageFormat\": \"binary_sign_disk_ann_v1\",",
+            "\"storageFormat\": \"binary_sign_disk_ann_v1\",\"storageFormat\": \"binary_sign_disk_ann_v1\",",
+            1,
+        );
+        assert_ne!(
+            duplicate, staged,
+            "fixture must contain the storageFormat key"
+        );
+        fs::write(active.layout().manifest_path(), duplicate).expect("duplicate-key manifest");
+
+        assert!(needs_recovery(active.layout()).is_err());
+        assert!(recover_build(active.layout()).is_err());
+        assert!(active.layout().backup_index_dir().join("old").is_file());
+        assert!(!active.layout().index_dir().exists());
+    }
+
+    #[test]
+    fn version_three_publication_recovers_the_previous_index() {
+        let directory = tempdir().expect("workspace");
+        let base = manifest(directory.path());
+        let active = binary_diskann_workspace(&base);
+        write_active(&active);
+
+        let build = stage(&active);
+        let record = read_record(active.layout())
+            .expect("read build record")
+            .expect("pending build record");
+        assert_eq!(
+            record.index_version,
+            super::super::BINARY_DISKANN_INDEX_VERSION
+        );
+        begin_publication(&build).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move old index to backup");
+
+        assert!(needs_recovery(active.layout()).expect("recovery required"));
+        recover_build(active.layout()).expect("restore prior version three index");
+        assert!(active.layout().index_dir().join("old").is_file());
+        assert!(!active.layout().backup_index_dir().exists());
+        assert!(!active.layout().staged_index_dir().exists());
+        assert_eq!(
+            read_workspace_manifest(active.source_root(), active.layout()).expect("manifest"),
+            Some(active),
+        );
+    }
+
+    #[test]
+    fn interrupted_version_two_to_three_publication_restores_version_two() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let target = binary_diskann_workspace(&active);
+        prepare_build(&target).expect("stage version three publication");
+        fs::write(target.layout().staged_index_dir().join("new"), "new format")
+            .expect("staged marker");
+        begin_publication(&target).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move version two index to backup");
+
+        assert!(needs_recovery(active.layout()).expect("recovery required"));
+        recover_build(active.layout()).expect("roll back interrupted format change");
+        assert!(active.layout().index_dir().join("old").is_file());
+        assert!(!active.layout().backup_index_dir().exists());
+        assert!(!active.layout().staged_index_dir().exists());
+        assert_eq!(
+            read_workspace_manifest(active.source_root(), active.layout()).expect("manifest"),
+            Some(active),
+        );
+    }
+
+    #[test]
+    fn committed_outer_v3_with_mismatched_inner_schema_keeps_rollback_backup() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let target = binary_diskann_workspace(&active);
+        prepare_build(&target).expect("stage version three publication");
+        fs::write(target.layout().staged_index_dir().join("new"), "new format")
+            .expect("staged marker");
+        begin_publication(&target).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move old index to backup");
+        move_index(
+            target.layout().staged_index_dir(),
+            target.layout().index_dir(),
+        )
+        .expect("install new storage");
+        write_workspace_manifest(target.layout().manifest_path(), &target)
+            .expect("commit outer V3 manifest");
+
+        let fp16 = active
+            .index()
+            .descriptor()
+            .expect("descriptor")
+            .default_embedding_model();
+        let schema = serde_json::json!({
+            "path_encoding": "components",
+            "binary_sign_storage": false,
+            "embeddings": [fp16],
+        });
+        fs::write(
+            target.layout().index_dir().join("schema.json"),
+            serde_json::to_vec(&schema).expect("inner schema JSON"),
+        )
+        .expect("mismatched inner schema");
+
+        assert!(recover_build(target.layout()).is_err());
+        assert!(target.layout().backup_index_dir().join("old").is_file());
+        assert!(target.layout().index_dir().join("schema.json").is_file());
+    }
+
+    #[test]
+    fn shared_read_rejects_v1_before_recovering_pending_publication() {
+        let directory = tempdir().expect("workspace");
+        let base = manifest(directory.path());
+        let active = binary_diskann_workspace(&base);
+        write_active(&active);
+
+        let build = stage(&active);
+        begin_publication(&build).expect("begin publication");
+        move_index(
+            active.layout().index_dir(),
+            active.layout().backup_index_dir(),
+        )
+        .expect("move old index to backup");
+
+        let error = crate::workspace::lock::try_acquire_workspace_read(
+            active.source_root(),
+            active.layout(),
+            "binary-diskann-v1-test",
+        )
+        .expect_err("unsupported V1 must not enter recovery");
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+        assert!(active.layout().backup_index_dir().join("old").is_file());
+        assert!(build.layout().staged_index_dir().join("new").is_file());
+        assert!(!active.layout().index_dir().exists());
+    }
+
+    #[test]
+    fn version_three_publish_rejects_an_inner_schema_mismatch_before_commit() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let original_manifest = fs::read(active.layout().manifest_path()).expect("old manifest");
+        let target = binary_diskann_workspace(&active);
+        prepare_build(&target).expect("stage version three publication");
+        let fp16 = active
+            .index()
+            .descriptor()
+            .expect("descriptor")
+            .default_embedding_model();
+        let schema = serde_json::json!({
+            "path_encoding": "components",
+            "binary_sign_storage": false,
+            "embeddings": [fp16],
+        });
+        fs::write(
+            target.layout().staged_index_dir().join("schema.json"),
+            serde_json::to_vec(&schema).expect("inner schema JSON"),
+        )
+        .expect("mismatched staged schema");
+
+        assert!(publish_build(target.clone(), 3).is_err());
+        assert_eq!(
+            fs::read(active.layout().manifest_path()).expect("unchanged manifest"),
+            original_manifest,
+        );
+        assert!(active.layout().index_dir().join("old").is_file());
+        assert!(!active.layout().backup_index_dir().exists());
+        assert!(!active.layout().staged_index_dir().exists());
+    }
+
+    #[test]
+    fn binary_diskann_bundle_validation_checks_identity_digest_and_bounds() {
+        let directory = tempdir().expect("temporary bundle");
+        let root = directory.path();
+        let generation = Uuid::new_v4().to_string();
+        let mut identity = b"ZGIDV1\0\0".to_vec();
+        identity.extend_from_slice(Uuid::parse_str(&generation).expect("generation").as_bytes());
+        identity.extend_from_slice(&2_u32.to_le_bytes());
+        identity.extend_from_slice(&1_u64.to_le_bytes());
+        identity.extend_from_slice(&1_u64.to_le_bytes());
+        identity.extend_from_slice(&5_u64.to_le_bytes());
+        identity.extend_from_slice(b"doc-1");
+        let identity_digest = crate::utils::sha256_parts([identity.as_slice()]);
+        let mut trust = Vec::with_capacity(300);
+        trust.extend_from_slice(b"ZGV1TRST");
+        trust.extend_from_slice(&1_u32.to_le_bytes());
+        trust.extend_from_slice(&2_u32.to_le_bytes());
+        trust.extend_from_slice(&1_u32.to_le_bytes());
+        trust.extend_from_slice(&1_u64.to_le_bytes());
+        trust.extend_from_slice(Uuid::parse_str(&generation).expect("generation").as_bytes());
+        for digest in 1_u8..=8 {
+            trust.extend_from_slice(&[digest; 32]);
+        }
+        let metadata = BinaryDiskAnnManifest::new(
+            generation,
+            "binary-diskann/graph".to_owned(),
+            "binary-diskann/identity.bin".to_owned(),
+            2,
+            1,
+            identity_digest,
+            trust,
+        )
+        .expect("metadata");
+        let graph = root.join(metadata.graph_path());
+        fs::create_dir_all(&graph).expect("graph directory");
+        fs::write(graph.join("graph.zvec"), b"candidate graph").expect("graph bytes");
+        let identity_path = root.join(metadata.identity_path());
+        fs::create_dir_all(identity_path.parent().expect("identity parent"))
+            .expect("identity directory");
+        fs::write(&identity_path, &identity).expect("identity bytes");
+
+        validate_binary_diskann_bundle(root, &metadata).expect("valid bundle");
+        fs::write(&identity_path, b"tampered").expect("tamper identity");
+        assert!(validate_binary_diskann_bundle(root, &metadata).is_err());
+    }
+
+    #[test]
+    fn binary_diskann_staged_generation_commits_pinned_sidecar_metadata() {
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let build = binary_diskann_workspace(&active);
+        prepare_build(&build).expect("stage V1 generation");
+        write_test_schema(&build, build.layout().staged_index_dir());
+        write_binary_diskann_bundle(&build, build.layout().staged_index_dir());
+        fs::write(build.layout().staged_index_dir().join("new"), "new rows").expect("staged rows");
+        let metadata = build
+            .binary_diskann_manifest()
+            .expect("outer trust metadata")
+            .clone();
+
+        publish_build(build.clone(), 3).expect("publish validated sidecar generation");
+        let committed = read_workspace_manifest(directory.path(), build.layout())
+            .expect("read committed manifest")
+            .expect("manifest exists");
+        assert_eq!(committed.storage_generation(), build.storage_generation());
+        assert_eq!(committed.binary_diskann_manifest(), Some(&metadata));
+        assert!(
+            build
+                .layout()
+                .index_dir()
+                .join(metadata.graph_path())
+                .is_dir()
+        );
+        assert!(
+            build
+                .layout()
+                .index_dir()
+                .join(metadata.identity_path())
+                .is_file()
+        );
+        assert!(!build.layout().backup_index_dir().exists());
     }
 
     #[test]
@@ -971,5 +1587,36 @@ mod tests {
         fs::create_dir_all(active.layout().backup_index_dir()).expect("unowned backup");
         assert!(recover_build_for_rebuild(active.layout()).is_err());
         assert!(active.layout().backup_index_dir().exists());
+    }
+
+    // Characterization only: this demonstrates why an inner storage schema
+    // cannot protect a future format against pre-open recovery. It does not
+    // provide a compatibility gate or test an older installed binary.
+    #[test]
+    fn orphan_recovery_attempts_cleanup_without_reading_inner_schema() {
+        use std::cell::Cell;
+
+        let directory = tempdir().expect("workspace");
+        let active = manifest(directory.path());
+        write_active(&active);
+        let orphan = active.layout().staged_index_dir();
+        fs::create_dir_all(orphan).expect("orphaned stage");
+        let schema = orphan.join("schema.json");
+        let future_schema = br#"{"binary_sign_diskann_storage_version":1}"#;
+        fs::write(&schema, future_schema).expect("future inner schema");
+        let attempted = Cell::new(false);
+        let intercept = |path: &Path| {
+            assert_eq!(path, orphan);
+            attempted.set(true);
+            Err(EngineError::storage_failure("intercepted fixture cleanup"))
+        };
+
+        assert!(recover_build_with(active.layout(), false, &intercept).is_err());
+        assert!(attempted.get(), "recovery must reach the cleanup callback");
+        assert_eq!(
+            fs::read(schema).expect("fixture schema preserved"),
+            future_schema
+        );
+        assert!(active.layout().index_dir().join("old").is_file());
     }
 }

@@ -1,5 +1,6 @@
 //! Types used by [`crate::ZvecGrep::index`].
 
+pub use crate::domain::VectorIndexQuantization;
 pub use options::IndexOptions;
 pub use result::IndexResult;
 
@@ -20,6 +21,23 @@ pub mod options {
     use tokio_util::sync::CancellationToken;
 
     use super::progress::IndexProgressReporter;
+
+    fn deserialize_request_vector_index_quantization<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<super::VectorIndexQuantization>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let quantization = Option::<super::VectorIndexQuantization>::deserialize(deserializer)?;
+        #[cfg(not(feature = "experimental-sign-scale-v1"))]
+        if quantization == Some(super::VectorIndexQuantization::BinarySignDiskAnnV1) {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "binary DiskANN V1 storage is not supported by this build",
+            ));
+        }
+        Ok(quantization)
+    }
+
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
@@ -37,6 +55,14 @@ pub mod options {
         /// index stays untouched.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub graph_indexing: Option<bool>,
+        /// Select the persisted vector index quantizer. Omission keeps the saved
+        /// choice; changing it requires `rebuild`.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_request_vector_index_quantization",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub vector_index_quantization: Option<super::VectorIndexQuantization>,
         /// Automatic refreshes require an existing enabled index instead of creating one.
         /// This admission policy is runtime-only and never accepted from transport requests.
         #[serde(skip)]
@@ -800,7 +826,7 @@ pub mod result {
 mod tests {
     use tokio_util::sync::CancellationToken;
 
-    use super::{IndexOptions, progress::IndexProgressReporter};
+    use super::{IndexOptions, VectorIndexQuantization, progress::IndexProgressReporter};
 
     #[test]
     fn index_progress_reporter_is_runtime_only() {
@@ -819,6 +845,45 @@ mod tests {
         assert!(decoded.on_progress.is_none());
         assert!(decoded.signal.is_none());
         assert_eq!(decoded.root, request.root);
+    }
+
+    #[test]
+    fn vector_index_quantization_is_optional_and_round_trips() {
+        let default = serde_json::to_value(IndexOptions::default()).expect("default options");
+        assert!(default.get("vector_index_quantization").is_none());
+
+        let mut requested = default;
+        requested["vector_index_quantization"] = serde_json::json!("binary_sign");
+        let options: IndexOptions = serde_json::from_value(requested).expect("binary-sign request");
+        assert_eq!(
+            options.vector_index_quantization,
+            Some(VectorIndexQuantization::BinarySign)
+        );
+        let encoded = serde_json::to_value(options).expect("serialize quantization");
+        assert_eq!(encoded["vector_index_quantization"], "binary_sign");
+
+        #[cfg(not(feature = "experimental-sign-scale-v1"))]
+        {
+            let mut unavailable = serde_json::to_value(IndexOptions::default())
+                .expect("default options for unavailable mode");
+            unavailable["vector_index_quantization"] = serde_json::json!("binary_sign_diskann_v1");
+            assert!(
+                serde_json::from_value::<IndexOptions>(unavailable).is_err(),
+                "unimplemented V1 mode must not be accepted by transport requests"
+            );
+        }
+        #[cfg(feature = "experimental-sign-scale-v1")]
+        {
+            let mut available = serde_json::to_value(IndexOptions::default())
+                .expect("default options for available mode");
+            available["vector_index_quantization"] = serde_json::json!("binary_sign_diskann_v1");
+            let options = serde_json::from_value::<IndexOptions>(available)
+                .expect("feature-enabled V1 mode should be accepted");
+            assert_eq!(
+                options.vector_index_quantization,
+                Some(VectorIndexQuantization::BinarySignDiskAnnV1)
+            );
+        }
     }
 
     #[test]

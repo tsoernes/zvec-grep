@@ -80,15 +80,22 @@ pub(crate) async fn query(
             .descriptor()
             .is_some_and(IndexDescriptor::graph_indexing);
         let storage = match read_sessions {
-            Some(cache) => cache.acquire(
+            Some(cache) => cache.acquire_for_workspace_with_binary(
                 &layout,
                 workspace.layout().index_dir(),
                 workspace
                     .storage_generation()
                     .expect("published index generation"),
                 graph_enabled,
+                workspace.storage_format(),
+                workspace.binary_diskann_manifest().cloned(),
             )?,
-            None => ReadSessionLease::open(workspace.layout().index_dir(), graph_enabled)?,
+            None => ReadSessionLease::open_for_workspace_with_binary(
+                workspace.layout().index_dir(),
+                graph_enabled,
+                workspace.storage_format(),
+                workspace.binary_diskann_manifest().cloned(),
+            )?,
         };
         let result = run(storage.storage());
         let close = storage.close();

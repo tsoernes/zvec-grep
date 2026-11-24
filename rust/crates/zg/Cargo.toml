@@ -10,6 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
+experimental-binary-diskann = ["zg-engine/experimental-sign-scale-v1", "zg-cli/experimental-binary-diskann"]
 cuda = ["zg-engine/cuda", "dep:llama-cpp-sys-2"]
 
 [dependencies]

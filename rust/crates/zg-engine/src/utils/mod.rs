@@ -20,6 +20,7 @@ pub(crate) use filesystem::resolve_directory;
 pub(crate) use filesystem::sync_directory;
 
 // Hashes.
+pub(crate) use hash::sha256_file;
 pub(crate) use hash::sha256_hex;
 pub(crate) use hash::sha256_hex_parts;
 pub(crate) use hash::sha256_parts;

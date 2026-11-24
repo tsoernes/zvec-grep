@@ -36,7 +36,7 @@ use crate::{
     storage::{IndexStore, types::WorkspaceIndexStorageOptions},
     utils::{directory_exists, resolve_directory},
     workspace::{
-        CURRENT_INDEX_VERSION,
+        BINARY_DISKANN_INDEX_VERSION, CURRENT_INDEX_VERSION,
         credentials::{decrypt_api_key, delete_credentials_key, encrypt_api_key},
         find_nearest_workspace,
         index::{
@@ -94,6 +94,16 @@ impl WorkspaceIndexService {
         models: &ModelRuntimeManager,
         mut options: IndexOptions,
     ) -> Result<IndexResult, EngineError> {
+        // This build option stays fail-closed unless the native generation API
+        // and workspace integration are compiled in.
+        #[cfg(not(feature = "experimental-sign-scale-v1"))]
+        if options.vector_index_quantization
+            == Some(crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1)
+        {
+            return Err(EngineError::unsupported(
+                "binary DiskANN V1 storage is not supported by this build",
+            ));
+        }
         normalize_model_paths(&mut options)?;
         let requested_root = resolve_directory(options.root.as_deref())?;
         let layout = WorkspaceLayout::new(requested_root.join(".zvec-grep"))?;
@@ -131,8 +141,6 @@ impl WorkspaceIndexService {
         // model: it is applied only by an explicit rebuild, and a plain refresh
         // is rejected by the descriptor compatibility check below.
         let graph_indexing = resolve_graph_indexing(existing.as_ref(), &options);
-        let rebuilding =
-            options.rebuild || !existing.as_ref().is_some_and(Workspace::index_enabled);
         if options.reset_paths
             || options.scan != crate::api::index::options::ScanRulesUpdate::default()
         {
@@ -181,20 +189,31 @@ impl WorkspaceIndexService {
             runtimes: acquired,
             descriptor,
         } = acquire_index_models(models, existing.as_ref(), &options, graph_indexing)?;
-        if !rebuilding
-            && let Some(previous) = existing
-                .as_ref()
-                .and_then(|workspace| workspace.index().descriptor())
-        {
-            previous
-                .ensure_index_compatible(&descriptor)
-                .map_err(|error| {
-                    error.with_help(if descriptor.graph_indexing() {
-                        "Rebuild the index with `zg --index --rebuild --graph`."
-                    } else {
-                        "Rebuild the index with `zg --index --rebuild`."
-                    })
-                })?;
+        let previous_descriptor = existing.as_ref().and_then(|workspace| {
+            if Workspace::index_enabled(workspace) {
+                workspace.index().descriptor()
+            } else {
+                None
+            }
+        });
+        validate_index_compatibility(previous_descriptor, &descriptor, options.rebuild).map_err(
+            |error| {
+                error.with_help(if descriptor.graph_indexing() {
+                    "Rebuild the index with `zg --index --rebuild --graph`."
+                } else {
+                    "Rebuild the index with `zg --index --rebuild`."
+                })
+            },
+        )?;
+        let binary_diskann = workspace_index_format(&descriptor).1.is_some();
+        // Binary DiskANN refreshes always use a complete staged generation;
+        // descriptor compatibility above still requires an explicit rebuild
+        // when changing quantization modes.
+        let rebuilding = options.rebuild
+            || binary_diskann
+            || !existing.as_ref().is_some_and(Workspace::index_enabled);
+        if rebuilding {
+            options.changes.clear();
         }
         let mut workspace = index_workspace_state(
             &requested_root,
@@ -222,7 +241,10 @@ impl WorkspaceIndexService {
         if result.is_err() && rebuilding {
             let _ = discard_build(&workspace);
         }
-        let (indexed, completed) = result?;
+        let (indexed, completed, binary_diskann) = result?;
+        if let Some(metadata) = binary_diskann {
+            workspace = workspace.with_binary_diskann_manifest(Some(metadata))?;
+        }
         let now = epoch_millis();
         if rebuilding {
             publish_build(workspace, now)?;
@@ -247,20 +269,37 @@ impl WorkspaceIndexService {
         models: Vec<ModelRuntimeLease>,
         options: &IndexOptions,
         home_lock: Arc<LockGuard>,
-    ) -> Result<(IndexResult, Option<IndexProgress>), EngineError> {
+    ) -> Result<
+        (
+            IndexResult,
+            Option<IndexProgress>,
+            Option<crate::domain::BinaryDiskAnnManifest>,
+        ),
+        EngineError,
+    > {
         let storage_path = if rebuilding {
             workspace.layout().staged_index_dir()
         } else {
             workspace.layout().index_dir()
         };
-        let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
-            graph_enabled: workspace
-                .index()
-                .descriptor()
-                .is_some_and(IndexDescriptor::graph_indexing),
-            storage_path: storage_path.to_path_buf(),
-            embeddings: models.iter().map(|model| model.info().clone()).collect(),
-        })
+        let descriptor = workspace
+            .index()
+            .descriptor()
+            .ok_or_else(|| EngineError::internal("index workspace has no descriptor"))?;
+        let mut embeddings = Vec::with_capacity(1 + descriptor.embedding_routes().len());
+        embeddings.push(descriptor.default_embedding_model().clone());
+        embeddings.extend(descriptor.embedding_routes().values().cloned());
+        let storage = IndexStore::open_for_workspace(
+            WorkspaceIndexStorageOptions::ReadWrite {
+                graph_enabled: workspace
+                    .index()
+                    .descriptor()
+                    .is_some_and(IndexDescriptor::graph_indexing),
+                storage_path: storage_path.to_path_buf(),
+                embeddings,
+            },
+            workspace.storage_format(),
+        )
         .map_err(|mut error| {
             if let Some(help) = error.help() {
                 let help = format!(
@@ -374,9 +413,33 @@ impl WorkspaceIndexService {
                 ..progress.clone()
             });
         }
-        // Flush writes and close storage before the active manifest can select
-        // the completed generation.
+        // Drain any search leases before building the immutable graph. The graph
+        // is created in the staged directory and must close before publication.
         writer.retire().await;
+        #[cfg(feature = "experimental-sign-scale-v1")]
+        let binary_diskann_result = if result.is_ok()
+            && rebuilding
+            && workspace.storage_format()
+                == Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        {
+            match workspace.storage_generation() {
+                Some(generation) => writer
+                    .session
+                    .storage
+                    .build_binary_diskann(storage_path, generation)
+                    .map(Some),
+                None => Err(EngineError::internal(
+                    "binary DiskANN build has no staged storage generation",
+                )),
+            }
+        } else {
+            Ok(None)
+        };
+        #[cfg(not(feature = "experimental-sign-scale-v1"))]
+        let binary_diskann_result: Result<
+            Option<crate::domain::BinaryDiskAnnManifest>,
+            EngineError,
+        > = Ok(None);
         let close_result = writer.session.storage.close();
         let indexed = result?;
         close_result?;
@@ -389,7 +452,8 @@ impl WorkspaceIndexService {
                 "indexing was cancelled before publication",
             ));
         }
-        Ok((indexed, completed))
+        let binary_diskann = binary_diskann_result?;
+        Ok((indexed, completed, binary_diskann))
     }
 
     pub(in crate::pipelines) async fn workspace_needs_refresh(
@@ -408,13 +472,17 @@ impl WorkspaceIndexService {
         if !workspace.index_enabled() {
             return Ok(false);
         }
-        let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-            graph_enabled: workspace
-                .index()
-                .descriptor()
-                .is_some_and(IndexDescriptor::graph_indexing),
-            storage_path: workspace.layout().index_dir().to_path_buf(),
-        })?;
+        let storage = IndexStore::open_for_workspace_with_binary_diskann(
+            WorkspaceIndexStorageOptions::ReadOnly {
+                graph_enabled: workspace
+                    .index()
+                    .descriptor()
+                    .is_some_and(IndexDescriptor::graph_indexing),
+                storage_path: workspace.layout().index_dir().to_path_buf(),
+            },
+            workspace.storage_format(),
+            workspace.binary_diskann_manifest().cloned(),
+        )?;
         let status =
             get_workspace_index_status(&workspace, &storage, &self.scanner, signal, false).await;
         let close = storage.close();
@@ -427,6 +495,7 @@ impl WorkspaceIndexService {
             || status.files_failed > 0)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn info(&self, options: InfoOptions) -> Result<InfoResult, EngineError> {
         let requested_root = resolve_directory(options.root.as_deref())?;
         let Some((source_root, layout)) = find_nearest_workspace(&requested_root)? else {
@@ -439,7 +508,14 @@ impl WorkspaceIndexService {
         let _lock = LockWait::new(None, None)?
             .acquire(&source_root, &layout, LockMode::Shared, "info")
             .await?;
-        let workspace = match inspect_workspace_manifest(&source_root, &layout)? {
+        let manifest_state = inspect_workspace_manifest(&source_root, &layout)?;
+        #[cfg(not(feature = "experimental-sign-scale-v1"))]
+        if manifest_state.requires_binary_diskann_v1() {
+            return Err(EngineError::unsupported(
+                "binary DiskANN V1 storage is not supported by this experimental build",
+            ));
+        }
+        let workspace = match manifest_state {
             ManifestState::Current(workspace) => workspace,
             ManifestState::Missing => {
                 return Ok(unindexed_info(
@@ -467,13 +543,17 @@ impl WorkspaceIndexService {
         let storage_exists = directory_exists(workspace.layout().index_dir())?;
         let indexed = metadata_indexed && storage_exists;
         let status = if options.include_status && indexed {
-            let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-                graph_enabled: workspace
-                    .index()
-                    .descriptor()
-                    .is_some_and(IndexDescriptor::graph_indexing),
-                storage_path: workspace.layout().index_dir().to_path_buf(),
-            })?;
+            let storage = IndexStore::open_for_workspace_with_binary_diskann(
+                WorkspaceIndexStorageOptions::ReadOnly {
+                    graph_enabled: workspace
+                        .index()
+                        .descriptor()
+                        .is_some_and(IndexDescriptor::graph_indexing),
+                    storage_path: workspace.layout().index_dir().to_path_buf(),
+                },
+                workspace.storage_format(),
+                workspace.binary_diskann_manifest().cloned(),
+            )?;
             let status =
                 get_workspace_index_status(&workspace, &storage, &self.scanner, None, true)
                     .await
@@ -504,7 +584,7 @@ impl WorkspaceIndexService {
         Ok(InfoResult {
             compatibility: if metadata_indexed {
                 IndexCompatibility::Compatible {
-                    version: CURRENT_INDEX_VERSION,
+                    version: workspace.index_version(),
                 }
             } else {
                 IndexCompatibility::Unbuilt
@@ -562,7 +642,14 @@ fn load_index_workspace(
     layout: &WorkspaceLayout,
     options: &IndexOptions,
 ) -> Result<Option<Workspace>, EngineError> {
-    let existing = inspect_workspace_manifest(root, layout)?.into_workspace(options.rebuild)?;
+    let state = inspect_workspace_manifest(root, layout)?;
+    #[cfg(not(feature = "experimental-sign-scale-v1"))]
+    if state.requires_binary_diskann_v1() {
+        return Err(EngineError::unsupported(
+            "binary DiskANN V1 storage is not supported by this build",
+        ));
+    }
+    let existing = state.into_workspace(options.rebuild)?;
     // Recheck after admission: a queued refresh must not become a first build.
     if options.require_existing_index && !existing.as_ref().is_some_and(Workspace::index_enabled) {
         return Err(missing_refresh_index(root));
@@ -623,16 +710,51 @@ fn index_workspace_state(
         descriptor.graph_indexing(),
         descriptor.fts(),
     )?;
+    let (index_version, storage_format) = workspace_index_format(&descriptor);
     Workspace::new(
         source_root,
         layout.clone(),
         scan,
-        CURRENT_INDEX_VERSION,
+        index_version,
         Some(generation),
         active.map_or(now, Workspace::created_epoch_ms),
         now,
         IndexState::Enabled(Box::new(descriptor)),
     )
+    .map(|workspace| workspace.with_storage_format(storage_format))
+}
+
+fn workspace_index_format(
+    descriptor: &IndexDescriptor,
+) -> (u32, Option<crate::domain::WorkspaceStorageFormat>) {
+    let has_binary_diskann = std::iter::once(descriptor.default_embedding_model())
+        .chain(descriptor.embedding_routes().values())
+        .any(|embedding| {
+            embedding.vector_index_quantization()
+                == crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1
+        });
+    let storage_format =
+        has_binary_diskann.then_some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1);
+    let index_version = if storage_format.is_some() {
+        BINARY_DISKANN_INDEX_VERSION
+    } else {
+        CURRENT_INDEX_VERSION
+    };
+    (index_version, storage_format)
+}
+
+fn validate_index_compatibility(
+    previous: Option<&crate::domain::IndexDescriptor>,
+    next: &crate::domain::IndexDescriptor,
+    explicit_rebuild: bool,
+) -> Result<(), EngineError> {
+    if explicit_rebuild {
+        return Ok(());
+    }
+    if let Some(previous) = previous {
+        previous.ensure_index_compatible(next)?;
+    }
+    Ok(())
 }
 
 impl Default for WorkspaceIndexService {
@@ -696,8 +818,18 @@ fn acquire_index_models(
     graph_indexing: bool,
 ) -> Result<IndexModels, EngineError> {
     let model = acquire_model(models, existing, options)?;
+    let model_reference = model.info().model().reference();
+    let vector_index_quantization = resolve_vector_index_quantization(
+        existing,
+        &model_reference,
+        options.vector_index_quantization,
+    );
+    let model_info = model
+        .info()
+        .clone()
+        .with_vector_index_quantization(vector_index_quantization);
     let descriptor = IndexDescriptor::new(
-        model.info().clone(),
+        model_info,
         std::collections::BTreeMap::new(),
         std::collections::BTreeMap::new(),
         graph_indexing,
@@ -716,6 +848,25 @@ fn acquire_index_models(
         runtimes: vec![model],
         descriptor,
     })
+}
+
+fn resolve_vector_index_quantization(
+    existing: Option<&Workspace>,
+    model_reference: &str,
+    requested: Option<crate::domain::VectorIndexQuantization>,
+) -> crate::domain::VectorIndexQuantization {
+    requested
+        .or_else(|| {
+            existing
+                .and_then(|workspace| workspace.index().descriptor())
+                .and_then(|descriptor| {
+                    std::iter::once(descriptor.default_embedding_model())
+                        .chain(descriptor.embedding_routes().values())
+                        .find(|embedding| embedding.model().reference() == model_reference)
+                        .map(|embedding| embedding.vector_index_quantization())
+                })
+        })
+        .unwrap_or_default()
 }
 
 fn acquire_model(
@@ -986,7 +1137,10 @@ fn epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use tempfile::tempdir;
 
@@ -998,8 +1152,20 @@ mod tests {
             },
             info::InfoOptions,
         },
-        domain::{IndexDescriptor, IndexState, Workspace, WorkspaceLayout, model::Device},
+        domain::{
+            Content, ContentKind, IndexDescriptor, IndexState, VectorIndexQuantization, Workspace,
+            WorkspaceLayout,
+            model::{Device, EmbeddingMetric, EmbeddingModelInfo, EmbeddingResult, ModelInfo},
+        },
+        models::{EmbeddingModel, EmbeddingOptions, ModelError},
     };
+
+    #[cfg(all(
+        feature = "experimental-sign-scale-v1",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    use crate::storage::{IndexStore, types::WorkspaceIndexStorageOptions};
 
     use super::{ModelRuntimeManager, WorkspaceIndexService};
 
@@ -1211,12 +1377,12 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_index_versions() {
-        crate::workspace::manifest::require_current_index_version(super::CURRENT_INDEX_VERSION)
+        crate::workspace::manifest::require_supported_index_version(super::CURRENT_INDEX_VERSION)
             .expect("current index");
         for version in [
             0,
             super::CURRENT_INDEX_VERSION - 1,
-            super::CURRENT_INDEX_VERSION + 1,
+            super::BINARY_DISKANN_INDEX_VERSION + 1,
             u32::MAX,
         ] {
             assert_ne!(
@@ -1224,7 +1390,7 @@ mod tests {
                 super::CURRENT_INDEX_VERSION,
                 "samples must stay incompatible with the current version"
             );
-            let error = crate::workspace::manifest::require_current_index_version(version)
+            let error = crate::workspace::manifest::require_supported_index_version(version)
                 .expect_err("incompatible index format");
             assert_eq!(error.code(), crate::EngineError::INDEX_INCOMPATIBLE);
             assert!(
@@ -1234,6 +1400,95 @@ mod tests {
                     .contains("zg --index --rebuild")
             );
         }
+    }
+
+    #[test]
+    fn binary_diskann_selects_outer_version_three_only_for_that_mode() {
+        use std::collections::BTreeMap;
+
+        use crate::domain::{
+            ContentKind, FTS_CONFIG, IndexDescriptor, VectorIndexQuantization,
+            model::{EmbeddingMetric, EmbeddingModelInfo, ModelInfo},
+        };
+
+        let descriptor = |quantization| {
+            let embedding = EmbeddingModelInfo::new(
+                ModelInfo::new("local", "potion-code-16m-v2", [ContentKind::Text], 16)
+                    .expect("model"),
+                256,
+                EmbeddingMetric::Cosine,
+                None,
+                None,
+            )
+            .expect("embedding model")
+            .with_vector_index_quantization(quantization);
+            IndexDescriptor::new(
+                embedding,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                false,
+                FTS_CONFIG,
+            )
+            .expect("descriptor")
+        };
+
+        let legacy = descriptor(VectorIndexQuantization::Fp16);
+        let (version, format) = super::workspace_index_format(&legacy);
+        assert_eq!(version, super::CURRENT_INDEX_VERSION);
+        assert_eq!(format, None);
+
+        let binary_sign = descriptor(VectorIndexQuantization::BinarySign);
+        let (version, format) = super::workspace_index_format(&binary_sign);
+        assert_eq!(version, super::CURRENT_INDEX_VERSION);
+        assert_eq!(format, None);
+
+        let binary_diskann = descriptor(VectorIndexQuantization::BinarySignDiskAnnV1);
+        let (version, format) = super::workspace_index_format(&binary_diskann);
+        assert_eq!(version, super::BINARY_DISKANN_INDEX_VERSION);
+        assert_eq!(
+            format,
+            Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1),
+        );
+    }
+
+    #[test]
+    fn binary_diskann_quantization_change_requires_explicit_rebuild() {
+        use std::collections::BTreeMap;
+
+        use crate::domain::{
+            ContentKind, FTS_CONFIG, IndexDescriptor, VectorIndexQuantization,
+            model::{EmbeddingMetric, EmbeddingModelInfo, ModelInfo},
+        };
+
+        let descriptor = |quantization| {
+            let embedding = EmbeddingModelInfo::new(
+                ModelInfo::new("local", "potion-code-16m-v2", [ContentKind::Text], 16)
+                    .expect("model"),
+                256,
+                EmbeddingMetric::Cosine,
+                None,
+                None,
+            )
+            .expect("embedding model")
+            .with_vector_index_quantization(quantization);
+            IndexDescriptor::new(
+                embedding,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                false,
+                FTS_CONFIG,
+            )
+            .expect("descriptor")
+        };
+
+        let fp16 = descriptor(VectorIndexQuantization::Fp16);
+        let binary_sign = descriptor(VectorIndexQuantization::BinarySign);
+        let diskann = descriptor(VectorIndexQuantization::BinarySignDiskAnnV1);
+        assert!(super::validate_index_compatibility(Some(&fp16), &diskann, false).is_err());
+        assert!(super::validate_index_compatibility(Some(&binary_sign), &diskann, false).is_err());
+        assert!(super::validate_index_compatibility(Some(&fp16), &diskann, true).is_ok());
+        assert!(super::validate_index_compatibility(Some(&diskann), &diskann, false).is_ok());
+        assert!(super::validate_index_compatibility(None, &diskann, false).is_ok());
     }
 
     #[test]
@@ -1277,6 +1532,376 @@ mod tests {
             super::resolve_scan(Some(manifest.scan()), &options).expect("scan rules"),
             crate::domain::ScanRules::default()
         );
+    }
+
+    #[test]
+    fn binary_sign_quantization_preserves_omission_and_defaults_for_other_models() {
+        use std::collections::BTreeMap;
+
+        use crate::domain::{
+            ContentKind, FTS_CONFIG, VectorIndexQuantization,
+            model::{EmbeddingMetric, EmbeddingModelInfo, ModelInfo},
+        };
+
+        let directory = tempdir().expect("workspace");
+        let model = EmbeddingModelInfo::new(
+            ModelInfo::new(
+                "local",
+                "potion-code-16m-v2",
+                [ContentKind::Text, ContentKind::Code],
+                16,
+            )
+            .expect("model"),
+            256,
+            EmbeddingMetric::Cosine,
+            None,
+            None,
+        )
+        .expect("embedding")
+        .with_vector_index_quantization(VectorIndexQuantization::BinarySign);
+        let descriptor =
+            IndexDescriptor::new(model, BTreeMap::new(), BTreeMap::new(), false, FTS_CONFIG)
+                .expect("index descriptor");
+        let workspace = Workspace::new(
+            directory.path(),
+            WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("layout"),
+            crate::domain::ScanRules::default(),
+            super::CURRENT_INDEX_VERSION,
+            Some("00000000-0000-0000-0000-000000000001".to_owned()),
+            0,
+            0,
+            IndexState::Enabled(Box::new(descriptor)),
+        )
+        .expect("workspace");
+
+        assert_eq!(
+            super::resolve_vector_index_quantization(
+                Some(&workspace),
+                "local/potion-code-16m-v2",
+                None,
+            ),
+            VectorIndexQuantization::BinarySign,
+        );
+        assert_eq!(
+            super::resolve_vector_index_quantization(Some(&workspace), "local/another-model", None,),
+            VectorIndexQuantization::Fp16,
+        );
+        assert_eq!(
+            super::resolve_vector_index_quantization(
+                Some(&workspace),
+                "local/potion-code-16m-v2",
+                Some(VectorIndexQuantization::Fp16),
+            ),
+            VectorIndexQuantization::Fp16,
+        );
+    }
+
+    struct LocalIndexFixtureModel {
+        info: EmbeddingModelInfo,
+        vector: Vec<f32>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingModel for LocalIndexFixtureModel {
+        fn info(&self) -> &EmbeddingModelInfo {
+            &self.info
+        }
+
+        async fn embed(
+            &self,
+            inputs: &[Vec<Content>],
+            _options: EmbeddingOptions,
+        ) -> Result<EmbeddingResult, ModelError> {
+            Ok(EmbeddingResult {
+                vectors: inputs.iter().map(|_| self.vector.clone()).collect(),
+                truncated: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn binary_sign_rebuilds_and_searches_a_disposable_local_workspace() {
+        let directory = tempdir().expect("disposable local workspace");
+        let source = directory.path().join("fixture.rs");
+        std::fs::write(&source, "pub fn local_index_fixture() { let x = 1; }\n")
+            .expect("local source");
+
+        let model_reference = "local/potion-code-16m-v2";
+        let mut vector = vec![0.01_f32; 256];
+        vector[0] = 1.0;
+        let model_info = EmbeddingModelInfo::new(
+            ModelInfo::new(
+                "local",
+                "potion-code-16m-v2",
+                [ContentKind::Text, ContentKind::Code],
+                16,
+            )
+            .expect("fixture model"),
+            256,
+            EmbeddingMetric::Cosine,
+            Some(1024),
+            None,
+        )
+        .expect("fixture embedding model");
+        let fixture_vector = vector.clone();
+        let models = ModelRuntimeManager::with_factory_for_test({
+            let model_info = model_info.clone();
+            move |_requested, _config, _compute, _sessions| {
+                let model: Arc<dyn EmbeddingModel> = Arc::new(LocalIndexFixtureModel {
+                    info: model_info.clone(),
+                    vector: fixture_vector.clone(),
+                });
+                Ok(model)
+            }
+        });
+        let result = WorkspaceIndexService::new()
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(directory.path().to_path_buf()),
+                    rebuild: true,
+                    embedding: Some(EmbeddingModelSpec {
+                        reference: model_reference.to_owned(),
+                        revision: None,
+                        cache_dir: None,
+                        endpoint: None,
+                        device: Device::Cpu,
+                    }),
+                    vector_index_quantization: Some(VectorIndexQuantization::BinarySign),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("build disposable binary-sign index locally");
+        assert_eq!(result.files_added, 1);
+
+        let layout =
+            WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("workspace layout");
+        let workspace = super::read_workspace_manifest(directory.path(), &layout)
+            .expect("read local manifest")
+            .expect("published local index");
+        assert_eq!(
+            workspace
+                .index()
+                .descriptor()
+                .expect("index descriptor")
+                .default_embedding_model()
+                .vector_index_quantization(),
+            VectorIndexQuantization::BinarySign
+        );
+
+        let storage = crate::storage::IndexStore::open(
+            crate::storage::types::WorkspaceIndexStorageOptions::ReadOnly {
+                storage_path: layout.index_dir().to_path_buf(),
+                graph_enabled: false,
+            },
+        )
+        .expect("reopen disposable local index");
+        let hits = storage
+            .search_vector(model_reference, &vector, 5, None)
+            .expect("search local binary-sign index");
+        assert!(!hits.is_empty());
+        storage.close().expect("close disposable index");
+        models.close();
+    }
+
+    #[cfg(all(
+        feature = "experimental-sign-scale-v1",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    struct LocalBinaryDiskAnnFixtureModel {
+        info: EmbeddingModelInfo,
+    }
+
+    #[cfg(all(
+        feature = "experimental-sign-scale-v1",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[async_trait::async_trait]
+    impl EmbeddingModel for LocalBinaryDiskAnnFixtureModel {
+        fn info(&self) -> &EmbeddingModelInfo {
+            &self.info
+        }
+
+        async fn embed(
+            &self,
+            inputs: &[Vec<crate::domain::Content>],
+            _options: EmbeddingOptions,
+        ) -> Result<EmbeddingResult, ModelError> {
+            let vectors = inputs
+                .iter()
+                .map(|contents| {
+                    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+                    for content in contents {
+                        let text = match content {
+                            crate::domain::Content::Text(text)
+                            | crate::domain::Content::Code(text) => text.as_str(),
+                            crate::domain::Content::Image(_) => "",
+                        };
+                        for byte in text.bytes() {
+                            hash ^= u64::from(byte);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    }
+                    (0..self.info.dimension())
+                        .map(|index| {
+                            if (hash >> (index % u64::BITS as usize)) & 1 == 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(EmbeddingResult {
+                vectors,
+                truncated: Vec::new(),
+            })
+        }
+    }
+
+    #[cfg(all(
+        feature = "experimental-sign-scale-v1",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn binary_diskann_publishes_reopens_searches_and_rebuilds_whole_generation() {
+        use crate::domain::{ContentKind, VectorIndexQuantization};
+
+        let directory = tempdir().expect("disposable local workspace");
+        for index in 0..4 {
+            std::fs::write(
+                directory.path().join(format!("fixture-{index}.rs")),
+                format!("pub fn fixture_{index}() {{ let marker = {index}; }}\n"),
+            )
+            .expect("local source");
+        }
+
+        let model_reference = "local/potion-code-16m-v2";
+        let model_info = EmbeddingModelInfo::new(
+            ModelInfo::new(
+                "local",
+                "potion-code-16m-v2",
+                [ContentKind::Text, ContentKind::Code],
+                16,
+            )
+            .expect("fixture model"),
+            256,
+            EmbeddingMetric::Cosine,
+            Some(1024),
+            None,
+        )
+        .expect("fixture embedding model");
+        let models = ModelRuntimeManager::with_factory_for_test({
+            let model_info = model_info.clone();
+            move |_requested, _config, _compute, _sessions| {
+                let model: Arc<dyn EmbeddingModel> = Arc::new(LocalBinaryDiskAnnFixtureModel {
+                    info: model_info.clone(),
+                });
+                Ok(model)
+            }
+        });
+        let service = WorkspaceIndexService::new();
+        let options = IndexOptions {
+            root: Some(directory.path().to_path_buf()),
+            embedding: Some(EmbeddingModelSpec {
+                reference: model_reference.to_owned(),
+                revision: None,
+                cache_dir: None,
+                endpoint: None,
+                device: Device::Cpu,
+            }),
+            vector_index_quantization: Some(VectorIndexQuantization::BinarySignDiskAnnV1),
+            ..IndexOptions::default()
+        };
+        let first = service
+            .index(&models, options.clone())
+            .await
+            .expect("build disposable binary DiskANN workspace");
+        assert_eq!(first.files_added, 4);
+
+        let layout =
+            WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("workspace layout");
+        let workspace = super::read_workspace_manifest(directory.path(), &layout)
+            .expect("read current manifest")
+            .expect("published workspace");
+        assert_eq!(
+            workspace.storage_format(),
+            Some(crate::domain::WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        );
+        let first_generation = workspace
+            .storage_generation()
+            .expect("published storage generation")
+            .to_owned();
+        let metadata = workspace
+            .binary_diskann_manifest()
+            .expect("published generation trust")
+            .clone();
+        assert_eq!(metadata.storage_generation(), first_generation);
+
+        let info = service
+            .info(InfoOptions {
+                root: Some(directory.path().to_path_buf()),
+                include_status: true,
+                include_counts: true,
+            })
+            .await
+            .expect("info opens the pinned DiskANN generation");
+        assert!(info.indexed);
+        assert!(info.status.is_some());
+
+        let descriptor = workspace.index().descriptor().expect("index descriptor");
+        let storage = IndexStore::open_for_workspace_with_binary_diskann(
+            WorkspaceIndexStorageOptions::ReadOnly {
+                graph_enabled: descriptor.graph_indexing(),
+                storage_path: layout.index_dir().to_path_buf(),
+            },
+            workspace.storage_format(),
+            Some(metadata),
+        )
+        .expect("reopen pinned DiskANN workspace");
+        let query = vec![1.0_f32; model_info.dimension()];
+        let hits = storage
+            .search_vector(model_reference, &query, 10, None)
+            .expect("search reopened DiskANN workspace");
+        assert!(!hits.is_empty());
+        assert!(hits.len() <= 4);
+        storage.close().expect("close reopened workspace");
+
+        std::fs::write(
+            directory.path().join("fixture-0.rs"),
+            "pub fn fixture_0() { let changed = true; }\n",
+        )
+        .expect("modify source before refresh");
+        let refreshed = service
+            .index(&models, options)
+            .await
+            .expect("V1 pass rebuilds a complete staged generation");
+        assert_eq!(
+            refreshed.files_added, 4,
+            "V1 refresh rebuilds into an empty stage"
+        );
+        let updated = super::read_workspace_manifest(directory.path(), &layout)
+            .expect("read refreshed manifest")
+            .expect("refreshed workspace");
+        assert_ne!(
+            updated.storage_generation(),
+            Some(first_generation.as_str()),
+            "binary DiskANN refresh must replace rows and graph as one generation"
+        );
+        assert_eq!(
+            updated
+                .binary_diskann_manifest()
+                .expect("refreshed trust")
+                .storage_generation(),
+            updated.storage_generation().expect("refreshed generation")
+        );
+        models.close();
     }
 
     #[tokio::test]
@@ -1837,6 +2462,25 @@ mod tests {
         .expect("active");
         let published = build_target(&active);
         super::prepare_build(&published).expect("build");
+        let descriptor = published
+            .index()
+            .descriptor()
+            .expect("staged index descriptor");
+        let mut embeddings = vec![descriptor.default_embedding_model().clone()];
+        embeddings.extend(descriptor.embedding_routes().values().cloned());
+        let staged_store = crate::storage::IndexStore::open_for_workspace(
+            crate::storage::types::WorkspaceIndexStorageOptions::ReadWrite {
+                graph_enabled: published
+                    .index()
+                    .descriptor()
+                    .is_some_and(IndexDescriptor::graph_indexing),
+                storage_path: published.layout().staged_index_dir().to_path_buf(),
+                embeddings,
+            },
+            published.storage_format(),
+        )
+        .expect("initialize staged storage schema");
+        staged_store.close().expect("close staged store");
         super::publish_build(published.clone(), super::epoch_millis())
             .expect("publish completed build");
         service
@@ -2373,6 +3017,31 @@ mod tests {
             std::fs::read(original_build).expect("original build unchanged"),
             original_bytes
         );
+        models.close();
+    }
+
+    #[cfg(not(feature = "experimental-sign-scale-v1"))]
+    #[tokio::test]
+    async fn binary_diskann_v1_is_rejected_before_path_or_registry_mutation() {
+        let directory = tempdir().expect("disposable parent");
+        let absent_root = directory.path().join("must-not-be-created");
+        let service = WorkspaceIndexService::new();
+        let models = ModelRuntimeManager::new();
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(absent_root.clone()),
+                    vector_index_quantization: Some(
+                        crate::domain::VectorIndexQuantization::BinarySignDiskAnnV1,
+                    ),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect_err("unimplemented V1 mode must fail before setup");
+        assert_eq!(error.code(), crate::EngineError::UNSUPPORTED);
+        assert!(!absent_root.exists());
         models.close();
     }
 

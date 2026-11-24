@@ -57,6 +57,7 @@ pub(crate) use graph::PreprocessorKind;
 // Models.
 pub(crate) use model::EmbeddingMetric;
 pub(crate) use model::EmbeddingModelInfo;
+pub use model::VectorIndexQuantization;
 
 // Sources.
 pub(crate) use source::ByteRange;
@@ -75,7 +76,9 @@ pub(crate) use source::TextRange;
 pub(crate) use source::{formats_for_path, reference_compatible_with};
 
 // Workspaces.
+pub(crate) use workspace::BinaryDiskAnnManifest;
 pub use workspace::ScanRules;
 pub(crate) use workspace::SourceRoot;
 pub(crate) use workspace::Workspace;
 pub(crate) use workspace::WorkspaceLayout;
+pub(crate) use workspace::WorkspaceStorageFormat;

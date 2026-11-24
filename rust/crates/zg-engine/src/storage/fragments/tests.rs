@@ -5,6 +5,8 @@ use crate::domain::{
 };
 use std::path::PathBuf;
 
+mod binary_diskann_acceptance;
+
 fn file(id: u32, path: impl Into<PathBuf>) -> FileRecord {
     FileRecord::new(
         FileId::new(id),
@@ -43,6 +45,27 @@ fn model() -> EmbeddingModelInfo {
     .expect("valid embedding metadata")
 }
 
+fn binary_sign_model() -> EmbeddingModelInfo {
+    EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            "fixture",
+            "fixture",
+            [
+                crate::domain::ContentKind::Text,
+                crate::domain::ContentKind::Code,
+            ],
+            32,
+        )
+        .expect("valid model metadata"),
+        64,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("valid embedding metadata")
+    .with_vector_index_quantization(VectorIndexQuantization::BinarySign)
+}
+
 fn metadata_store(path: &Path) -> Fragments {
     super::super::zvec::initialize().expect("initialize zvec");
     Fragments::open(path, &[model()], false).expect("fragment storage")
@@ -62,8 +85,14 @@ fn write_fixture(
     } else {
         Vec::new()
     };
-    let docs =
-        Fragments::prepare(file, entities, entries, &directories).expect("prepare fragments");
+    let docs = Fragments::prepare(
+        file,
+        entities,
+        entries,
+        &directories,
+        store.embedding_models(),
+    )
+    .expect("prepare fragments");
     store.write(&docs).expect("write fragments");
 }
 
@@ -705,6 +734,99 @@ fn embeddings_round_trip_as_fp16_and_remain_searchable() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].document_id, entries[1].fragment_id.as_str());
     assert_eq!(hits[0].path, StorageSearchPath::Vector);
+}
+
+#[test]
+fn binary_sign_scores_float_queries_with_each_supported_metric() {
+    let document = [2.0_f32, -1.0, 0.0];
+    let query = [1.0_f32, 1.0, -1.0];
+    let (packed, scale) = encode_sign_vector(&document).expect("encode signs");
+    assert_eq!(packed.len(), 1);
+    assert_eq!(scale, 1.0);
+
+    let cosine =
+        binary_sign_score(&query, &packed, scale, EmbeddingMetric::Cosine).expect("cosine score");
+    assert!((cosine - (-1.0 / 3.0)).abs() < 1e-12);
+    assert_eq!(
+        binary_sign_score(&query, &packed, scale, EmbeddingMetric::DotProduct)
+            .expect("dot-product score"),
+        -1.0
+    );
+    let euclidean = binary_sign_score(&query, &packed, scale, EmbeddingMetric::Euclidean)
+        .expect("Euclidean score");
+    assert!((euclidean + 8.0_f64.sqrt()).abs() < 1e-12);
+}
+
+#[test]
+fn binary_sign_near_equal_euclidean_and_zero_signs() {
+    let next = f32::from_bits(1.0_f32.to_bits() + 1);
+    let mut query = vec![1.0_f32; 20_000];
+    query[0] = next;
+    let signs = vec![0xff; 20_000 / 8];
+    let near =
+        binary_sign_score(&query, &signs, 1.0, EmbeddingMetric::Euclidean).expect("near score");
+    let far =
+        binary_sign_score(&query, &signs, next, EmbeddingMetric::Euclidean).expect("far score");
+    assert_eq!(near, -(f64::from(next) - 1.0));
+    assert!(near > far);
+    for (bits, scale) in [(0_u8, 0.0_f32), (1, -0.0)] {
+        let score = binary_sign_score(&[1.0], &[bits], scale, EmbeddingMetric::DotProduct)
+            .expect("zero score");
+        assert_eq!(score.to_bits(), 0.0_f64.to_bits());
+    }
+    assert_eq!(
+        binary_sign_score(&[1.0], &[1], 1.0, EmbeddingMetric::Euclidean)
+            .expect("identical score")
+            .to_bits(),
+        0.0_f64.to_bits(),
+    );
+}
+
+#[test]
+fn binary_sign_search_rejects_limits_above_the_shared_top_k_bound() {
+    let home = tempfile::tempdir().expect("disposable local index");
+    let store = Fragments::open(home.path(), &[binary_sign_model()], false)
+        .expect("create binary-sign fragment index");
+    let error = store
+        .search_vector("fixture/fixture", &[1.0; 64], MAX_TOP_K + 1, None)
+        .expect_err("binary-sign search must use the shared top-k bound");
+    assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn binary_sign_fragments_search_with_float_queries_and_reopen_from_a_local_index() {
+    let home = tempfile::tempdir().expect("disposable local index");
+    let binary_model = binary_sign_model();
+    let store = Fragments::open(home.path(), &[binary_model.clone()], false)
+        .expect("create binary-sign fragment index");
+    let (source, entities, mut entries) = metadata_fragments(1, "binary-sign");
+
+    let mut query = vec![0.01_f32; 64];
+    query[0] = 1.0;
+    let mut high_weight_match = vec![-0.01_f32; 64];
+    high_weight_match[0] = 1.0;
+    let mut low_weight_match = vec![0.01_f32; 64];
+    low_weight_match[0] = -1.0;
+    entries[0].vector = high_weight_match;
+    entries[1].vector = low_weight_match;
+
+    write_fixture(&store, &source, &entities, &entries);
+    store.flush().expect("flush local index");
+    let hits = store
+        .search_vector("fixture/fixture", &query, 2, None)
+        .expect("float query against packed signs");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].document_id, entries[0].fragment_id.as_str());
+
+    drop(store);
+    let reopened =
+        Fragments::open(home.path(), &[binary_model], true).expect("reopen disposable local index");
+    let hits = reopened
+        .search_vector("fixture/fixture", &query, 2, None)
+        .expect("query reopened binary-sign index");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].document_id, entries[0].fragment_id.as_str());
 }
 
 #[test]

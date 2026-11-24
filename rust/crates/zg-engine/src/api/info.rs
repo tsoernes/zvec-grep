@@ -447,7 +447,7 @@ mod tests {
         info.compatibility = IndexCompatibility::RebuildRequired {
             actual_version: Some(1),
             expected_version: 2,
-            reason: "unsupported index version 1; expected 2".into(),
+            reason: "unsupported index version 1; supported versions are 2 and 3".into(),
         };
         assert_eq!(info.index_status(), IndexStatus::RebuildRequired);
         info.indexed = false;

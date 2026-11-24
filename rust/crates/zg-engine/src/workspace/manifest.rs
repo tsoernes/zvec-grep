@@ -6,7 +6,10 @@ use std::{
 
 use crate::{
     EngineError,
-    domain::{IndexState, ScanRules, SourceRoot, Workspace, WorkspaceLayout},
+    domain::{
+        BinaryDiskAnnManifest, IndexState, ScanRules, SourceRoot, VectorIndexQuantization,
+        Workspace, WorkspaceLayout, WorkspaceStorageFormat,
+    },
     utils::{atomic_write, directory_exists, ensure_directory, reject_symlink, sync_directory},
 };
 
@@ -16,7 +19,11 @@ struct ManifestFields {
     source_root: SourceRoot,
     scan: ScanRules,
     index_version: u32,
+    #[serde(default)]
+    storage_format: Option<WorkspaceStorageFormat>,
     storage_generation: Option<String>,
+    #[serde(default)]
+    binary_diskann: Option<BinaryDiskAnnManifest>,
     created_time: u64,
     updated_time: u64,
     index: IndexState,
@@ -28,16 +35,31 @@ impl ManifestFields {
         source_root: &Path,
         layout: &WorkspaceLayout,
     ) -> Result<Workspace, EngineError> {
+        if let Some(reason) =
+            storage_format_mismatch(self.index_version, self.storage_format, &self.index)
+        {
+            return Err(EngineError::invalid_argument(reason));
+        }
+        if (self.storage_format == Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+            || index_uses_binary_diskann_v1(&self.index))
+            && self.binary_diskann.is_none()
+        {
+            return Err(EngineError::invalid_argument(
+                "binary DiskANN manifest requires independently pinned graph and identity metadata",
+            ));
+        }
         self.source_root.set_current_path(source_root)?;
         Workspace::from_manifest(
             self.source_root,
             layout.clone(),
             self.scan,
             self.index_version,
+            self.storage_format,
             self.storage_generation,
             self.created_time,
             self.updated_time,
             self.index,
+            self.binary_diskann,
         )
     }
 }
@@ -50,15 +72,33 @@ pub(crate) enum ManifestState {
         source_root: PathBuf,
         actual_version: Option<u32>,
         reason: String,
+        binary_diskann_v1: bool,
     },
 }
 
 impl ManifestState {
+    #[cfg(not(feature = "experimental-sign-scale-v1"))]
+    pub(crate) fn requires_binary_diskann_v1(&self) -> bool {
+        match self {
+            Self::Missing => false,
+            Self::Current(workspace) => workspace_uses_binary_diskann_v1(workspace),
+            Self::RebuildRequired {
+                binary_diskann_v1, ..
+            } => *binary_diskann_v1,
+        }
+    }
+
     /// Explicit rebuild uses readable settings without migrating incompatible data.
     pub(crate) fn into_workspace(self, rebuild: bool) -> Result<Option<Workspace>, EngineError> {
         match self {
             Self::Missing => Ok(None),
             Self::Current(manifest) => Ok(Some(*manifest)),
+            Self::RebuildRequired {
+                binary_diskann_v1: true,
+                ..
+            } => Err(EngineError::unsupported(
+                "binary DiskANN V1 storage is not supported by this experimental build",
+            )),
             Self::RebuildRequired { .. } if rebuild => Ok(None),
             Self::RebuildRequired {
                 source_root,
@@ -69,7 +109,7 @@ impl ManifestState {
     }
 }
 
-pub(crate) fn require_current_index_version(version: u32) -> Result<(), EngineError> {
+pub(crate) fn require_supported_index_version(version: u32) -> Result<(), EngineError> {
     if let Some(reason) = version_mismatch(version) {
         return Err(rebuild_required(reason));
     }
@@ -77,12 +117,78 @@ pub(crate) fn require_current_index_version(version: u32) -> Result<(), EngineEr
 }
 
 fn version_mismatch(version: u32) -> Option<String> {
-    (version != super::CURRENT_INDEX_VERSION).then(|| {
+    (!super::is_supported_index_version(version)).then(|| {
         format!(
-            "unsupported index version {version}; expected {}",
+            "unsupported index version {version}; supported versions are {} and {}",
             super::CURRENT_INDEX_VERSION,
+            super::BINARY_DISKANN_INDEX_VERSION,
         )
     })
+}
+
+fn storage_format_mismatch(
+    index_version: u32,
+    storage_format: Option<WorkspaceStorageFormat>,
+    index: &IndexState,
+) -> Option<String> {
+    let descriptor = index.descriptor();
+    let enabled = descriptor.is_some();
+    let has_binary_diskann = descriptor.is_some_and(|descriptor| {
+        descriptor
+            .default_embedding_model()
+            .vector_index_quantization()
+            == VectorIndexQuantization::BinarySignDiskAnnV1
+            || descriptor.embedding_routes().values().any(|embedding| {
+                embedding.vector_index_quantization()
+                    == VectorIndexQuantization::BinarySignDiskAnnV1
+            })
+    });
+    match (index_version, storage_format, enabled, has_binary_diskann) {
+        (super::CURRENT_INDEX_VERSION, None, _, false)
+        | (
+            super::BINARY_DISKANN_INDEX_VERSION,
+            Some(WorkspaceStorageFormat::BinarySignDiskAnnV1),
+            true,
+            true,
+        ) => None,
+        (super::CURRENT_INDEX_VERSION, None, _, true) => Some(
+            "binary DiskANN V1 embedding metadata requires the version 3 outer format".to_owned(),
+        ),
+        (super::CURRENT_INDEX_VERSION, Some(_), _, _) => Some(format!(
+            "workspace index version {} cannot declare a non-default storageFormat",
+            super::CURRENT_INDEX_VERSION,
+        )),
+        (super::BINARY_DISKANN_INDEX_VERSION, None, _, _) => Some(format!(
+            "workspace index version {} requires storageFormat binary_sign_disk_ann_v1",
+            super::BINARY_DISKANN_INDEX_VERSION,
+        )),
+        (super::BINARY_DISKANN_INDEX_VERSION, Some(_), false, _) => {
+            Some("binary DiskANN V1 storage format requires an enabled workspace index".to_owned())
+        }
+        (super::BINARY_DISKANN_INDEX_VERSION, Some(_), true, false) => Some(
+            "binary DiskANN V1 storage format requires a binary_sign_diskann_v1 embedding"
+                .to_owned(),
+        ),
+        _ => Some(format!("unsupported index version {index_version}")),
+    }
+}
+
+fn index_uses_binary_diskann_v1(index: &IndexState) -> bool {
+    index.descriptor().is_some_and(|descriptor| {
+        descriptor
+            .default_embedding_model()
+            .vector_index_quantization()
+            == VectorIndexQuantization::BinarySignDiskAnnV1
+            || descriptor.embedding_routes().values().any(|embedding| {
+                embedding.vector_index_quantization()
+                    == VectorIndexQuantization::BinarySignDiskAnnV1
+            })
+    })
+}
+
+pub(crate) fn workspace_uses_binary_diskann_v1(workspace: &Workspace) -> bool {
+    workspace.storage_format() == Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        || index_uses_binary_diskann_v1(workspace.index())
 }
 
 fn rebuild_required(reason: impl std::fmt::Display) -> EngineError {
@@ -102,6 +208,7 @@ pub(crate) fn inspect_workspace_manifest(
                     "workspace index '{}' has no manifest",
                     layout.index_dir().display(),
                 ),
+                binary_diskann_v1: false,
             });
         }
         return Ok(ManifestState::Missing);
@@ -116,6 +223,7 @@ pub(crate) fn inspect_workspace_manifest(
                     "invalid workspace manifest '{}': {error}",
                     layout.manifest_path().display()
                 ),
+                binary_diskann_v1: false,
             });
         }
     };
@@ -127,6 +235,7 @@ pub(crate) fn inspect_workspace_manifest(
                 "workspace manifest '{}': {reason}",
                 layout.manifest_path().display()
             ),
+            binary_diskann_v1: version == super::BINARY_DISKANN_INDEX_VERSION,
         });
     }
     // Decode the original bytes so nested duplicate fields are rejected too.
@@ -140,9 +249,24 @@ pub(crate) fn inspect_workspace_manifest(
                     "invalid workspace manifest '{}': {error}",
                     layout.manifest_path().display()
                 ),
+                binary_diskann_v1: version == super::BINARY_DISKANN_INDEX_VERSION,
             });
         }
     };
+    let binary_diskann_v1 = version == super::BINARY_DISKANN_INDEX_VERSION
+        || fields.storage_format == Some(WorkspaceStorageFormat::BinarySignDiskAnnV1)
+        || index_uses_binary_diskann_v1(&fields.index);
+    if let Some(reason) = storage_format_mismatch(version, fields.storage_format, &fields.index) {
+        return Ok(ManifestState::RebuildRequired {
+            source_root: source_root.to_path_buf(),
+            actual_version: Some(version),
+            reason: format!(
+                "workspace manifest '{}': {reason}",
+                layout.manifest_path().display()
+            ),
+            binary_diskann_v1,
+        });
+    }
     let workspace = match fields.into_workspace(source_root, layout) {
         Ok(workspace) => workspace,
         Err(error) if error.code() != EngineError::INVALID_ARGUMENT => return Err(error),
@@ -154,6 +278,7 @@ pub(crate) fn inspect_workspace_manifest(
                     "invalid workspace manifest '{}': {error}",
                     layout.manifest_path().display()
                 ),
+                binary_diskann_v1,
             });
         }
     };
@@ -222,8 +347,21 @@ pub(crate) fn write_workspace_manifest(
     path: &Path,
     manifest: &Workspace,
 ) -> Result<(), EngineError> {
-    require_current_index_version(manifest.index_version())
+    require_supported_index_version(manifest.index_version())
         .map_err(|error| error.with_workspace_root(manifest.source_root()))?;
+    if let Some(reason) = storage_format_mismatch(
+        manifest.index_version(),
+        manifest.storage_format(),
+        manifest.index(),
+    ) {
+        return Err(rebuild_required(reason).with_workspace_root(manifest.source_root()));
+    }
+    if workspace_uses_binary_diskann_v1(manifest) && manifest.binary_diskann_manifest().is_none() {
+        return Err(EngineError::invalid_argument(
+            "binary DiskANN manifest requires independently pinned graph and identity metadata",
+        )
+        .with_workspace_root(manifest.source_root()));
+    }
     let parent_dir = manifest_home(path)?;
     ensure_directory(parent_dir)?;
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -337,6 +475,52 @@ mod tests {
         .expect("fixture manifest")
     }
 
+    fn binary_diskann_index(index: &IndexState) -> IndexState {
+        let descriptor = index.descriptor().expect("enabled fixture index");
+        let default = descriptor
+            .default_embedding_model()
+            .clone()
+            .with_vector_index_quantization(VectorIndexQuantization::BinarySignDiskAnnV1);
+        let routes = descriptor
+            .embedding_routes()
+            .iter()
+            .map(|(kind, embedding)| {
+                (
+                    *kind,
+                    embedding.clone().with_vector_index_quantization(
+                        VectorIndexQuantization::BinarySignDiskAnnV1,
+                    ),
+                )
+            })
+            .collect();
+        IndexState::Enabled(Box::new(
+            IndexDescriptor::new(
+                default,
+                routes,
+                descriptor.embedding_configs().clone(),
+                descriptor.graph_indexing(),
+                descriptor.fts(),
+            )
+            .expect("binary DiskANN descriptor"),
+        ))
+    }
+
+    fn placeholder_binary_diskann_manifest(workspace: &Workspace) -> BinaryDiskAnnManifest {
+        BinaryDiskAnnManifest::new(
+            workspace
+                .storage_generation()
+                .expect("enabled workspace generation")
+                .to_owned(),
+            "binary-diskann/graph".to_owned(),
+            "binary-diskann/identity.bin".to_owned(),
+            1024,
+            17,
+            [0x42; 32],
+            vec![0x24; 300],
+        )
+        .expect("well-formed trust metadata")
+    }
+
     /// Rebuilds a manifest whose published descriptor records the graph switch.
     fn with_graph_indexing(manifest: &Workspace, enabled: bool) -> Workspace {
         let mut descriptor = manifest
@@ -356,6 +540,7 @@ mod tests {
             IndexState::Enabled(Box::new(descriptor)),
         )
         .expect("manifest")
+        .with_storage_format(manifest.storage_format())
     }
 
     #[test]
@@ -1282,7 +1467,7 @@ mod tests {
         let current = fixture_manifest(&layout);
         write_workspace_manifest(layout.manifest_path(), &current).expect("current manifest");
         let bytes = fs::read(layout.manifest_path()).expect("persisted manifest");
-        for version in [0, 1, 3, 4, 5, u32::MAX] {
+        for version in [0, 1, 4, 5, u32::MAX] {
             let mut unsupported = current.clone();
             unsupported = crate::domain::Workspace::new(
                 directory.path(),
@@ -1321,10 +1506,178 @@ mod tests {
             );
             let diagnostics = error.help().expect("version diagnostics");
             assert!(diagnostics.contains(&format!("unsupported index version {version}")));
-            assert!(diagnostics.contains("expected 2"));
+            assert!(diagnostics.contains("supported versions are 2 and 3"));
             assert!(diagnostics.contains("zg --index --rebuild"));
             fs::write(layout.manifest_path(), &bytes).expect("restore current manifest");
         }
+
+        let binary_diskann = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            current.storage_generation().map(str::to_owned),
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            binary_diskann_index(current.index()),
+        )
+        .expect("supported DiskANN version")
+        .with_storage_format(Some(WorkspaceStorageFormat::BinarySignDiskAnnV1))
+        .with_binary_diskann_manifest(Some(placeholder_binary_diskann_manifest(&current)))
+        .expect("pinned V1 metadata");
+        write_workspace_manifest(layout.manifest_path(), &binary_diskann)
+            .expect("persist version 3 manifest");
+        assert_eq!(
+            read_workspace_manifest(directory.path(), &layout).expect("read version 3"),
+            Some(binary_diskann),
+        );
+    }
+
+    #[test]
+    fn storage_format_marker_must_match_outer_version_and_enabled_state() {
+        let directory = tempdir().expect("temporary directory");
+        let layout = WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("layout");
+        fs::create_dir_all(layout.storage_dir()).expect("workspace home");
+        let current = fixture_manifest(&layout);
+
+        let wrong_v2 = current
+            .clone()
+            .with_storage_format(Some(WorkspaceStorageFormat::BinarySignDiskAnnV1));
+        assert!(write_workspace_manifest(layout.manifest_path(), &wrong_v2).is_err());
+
+        let version_two_diskann = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::CURRENT_INDEX_VERSION,
+            current.storage_generation().map(str::to_owned),
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            binary_diskann_index(current.index()),
+        )
+        .expect("version two workspace with DiskANN metadata");
+        assert!(write_workspace_manifest(layout.manifest_path(), &version_two_diskann).is_err());
+        fs::write(
+            layout.manifest_path(),
+            serde_json::to_vec(&version_two_diskann).expect("mismatched manifest"),
+        )
+        .expect("write mismatched fixture directly");
+        assert!(read_workspace_manifest(directory.path(), &layout).is_err());
+
+        let version_three_fp16 = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            current.storage_generation().map(str::to_owned),
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            current.index().clone(),
+        )
+        .expect("version three FP16 workspace")
+        .with_storage_format(Some(WorkspaceStorageFormat::BinarySignDiskAnnV1));
+        assert!(write_workspace_manifest(layout.manifest_path(), &version_three_fp16).is_err());
+
+        let missing_v3_marker = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            current.storage_generation().map(str::to_owned),
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            current.index().clone(),
+        )
+        .expect("version three workspace");
+        assert!(write_workspace_manifest(layout.manifest_path(), &missing_v3_marker).is_err());
+
+        let disabled_v3 = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            None,
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            IndexState::Disabled,
+        )
+        .expect("disabled workspace");
+        let disabled_v3 =
+            disabled_v3.with_storage_format(Some(WorkspaceStorageFormat::BinarySignDiskAnnV1));
+        assert!(write_workspace_manifest(layout.manifest_path(), &disabled_v3).is_err());
+    }
+
+    #[test]
+    fn binary_diskann_trust_metadata_round_trips_with_generation_binding() {
+        let directory = tempdir().expect("temporary directory");
+        let layout = WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("layout");
+        fs::create_dir_all(layout.storage_dir()).expect("workspace home");
+        let current = fixture_manifest(&layout);
+        let generation = current.storage_generation().expect("generation").to_owned();
+        let metadata = BinaryDiskAnnManifest::new(
+            generation.clone(),
+            "binary-diskann/graph".to_owned(),
+            "binary-diskann/identity.bin".to_owned(),
+            1024,
+            17,
+            [0x42; 32],
+            vec![0x24; 300],
+        )
+        .expect("metadata");
+        let workspace = Workspace::new(
+            directory.path(),
+            layout.clone(),
+            current.scan().clone(),
+            super::super::BINARY_DISKANN_INDEX_VERSION,
+            Some(generation.clone()),
+            current.created_epoch_ms(),
+            current.updated_epoch_ms(),
+            binary_diskann_index(current.index()),
+        )
+        .expect("enabled V1 workspace")
+        .with_storage_format(Some(WorkspaceStorageFormat::BinarySignDiskAnnV1))
+        .with_binary_diskann_manifest(Some(metadata.clone()))
+        .expect("bind metadata to generation");
+
+        write_workspace_manifest(layout.manifest_path(), &workspace).expect("write manifest");
+        let restored = read_workspace_manifest(directory.path(), &layout)
+            .expect("read manifest")
+            .expect("manifest present");
+        assert_eq!(restored, workspace);
+        assert_eq!(
+            restored.binary_diskann_manifest(),
+            Some(&metadata),
+            "outer manifest must preserve the identity digest and native trust bundle"
+        );
+
+        let mismatched = BinaryDiskAnnManifest::new(
+            uuid::Uuid::new_v4().to_string(),
+            "binary-diskann/graph".to_owned(),
+            "binary-diskann/identity.bin".to_owned(),
+            1024,
+            17,
+            [0x42; 32],
+            vec![0x24; 300],
+        )
+        .expect("structurally valid metadata");
+        assert!(
+            workspace
+                .clone()
+                .with_binary_diskann_manifest(Some(mismatched))
+                .is_err()
+        );
+        assert!(
+            BinaryDiskAnnManifest::new(
+                generation,
+                "../graph".to_owned(),
+                "binary-diskann/identity.bin".to_owned(),
+                1024,
+                17,
+                [0x42; 32],
+                vec![0x24; 300],
+            )
+            .is_err()
+        );
     }
 
     #[test]

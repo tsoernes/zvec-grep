@@ -8,8 +8,14 @@ repository.workspace = true
 publish.workspace = true
 description = "FP16 vector encoding for zvec collections"
 
+[features]
+# The V1 sidecar adapter requires the matching native immutable-generation API.
+# It is experimental and disabled by default.
+experimental-sign-scale-v1 = ["dep:sha2"]
+
 [dependencies]
 half = "2.7.1"
+sha2 = { workspace = true, optional = true }
 zvec-rust.workspace = true
 
 [dev-dependencies]

@@ -9,10 +9,18 @@ pub(crate) mod index;
 pub(crate) mod lock;
 pub(crate) mod manifest;
 
-// Compatibility version of persisted index metadata and storage. Every manifest
-// declares it, including uninitialized and disabled workspaces without an index.
-// Incompatible formats require an explicit rebuild instead of an implicit upgrade.
+// Default compatibility version of persisted index metadata and storage.
+// Existing FP16 and binary-sign workspaces remain at v2. Binary-sign DiskANN V1
+// uses a separate outer version so older zg readers reject it before recovery.
 pub(crate) const CURRENT_INDEX_VERSION: u32 = 2;
+pub(crate) const BINARY_DISKANN_INDEX_VERSION: u32 = 3;
+
+pub(crate) const fn is_supported_index_version(version: u32) -> bool {
+    matches!(
+        version,
+        CURRENT_INDEX_VERSION | BINARY_DISKANN_INDEX_VERSION
+    )
+}
 
 /// Finds the nearest workspace at or above the given directory.
 pub(crate) fn find_nearest_workspace(
